@@ -8,6 +8,7 @@ use mlx_rs::{
     quantization::Quantizable,
     Array,
 };
+use mlx_sys;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -57,6 +58,9 @@ impl KugelAudioModel {
         self.lm
             .eval()
             .map_err(|e| KugelAudioError::Model(format!("Failed to eval quantized LM: {e}")))?;
+        // Release original bf16 arrays from MLX's memory pool back to the OS.
+        // Without this, mlx holds the freed bf16 weights in its pool and memory stays high.
+        unsafe { mlx_sys::mlx_clear_cache() };
         eprintln!("LM quantized.");
         Ok(())
     }
