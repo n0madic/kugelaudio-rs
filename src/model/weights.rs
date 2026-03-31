@@ -191,7 +191,7 @@ pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> 
         .unwrap_or(config.diffusion_head_config.ddpm_num_inference_steps);
 
     let vae_dim = config.vae_dim() as usize;
-    let diffusion_head_config = config.diffusion_head_config.clone();
+    let diffusion_head_config = config.diffusion_head_config;
 
     Ok(KugelAudioModel {
         lm,

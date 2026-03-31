@@ -169,14 +169,13 @@ pub struct SpecialTokens {
 impl Default for SpecialTokens {
     fn default() -> Self {
         Self {
-            speech_start_id: 151652,
-            speech_end_id: 151653,
-            speech_diffusion_id: 151654,
-            eos_token_id: 151643,
+            speech_start_id: 151_652,
+            speech_end_id: 151_653,
+            speech_diffusion_id: 151_654,
+            eos_token_id: 151_643,
         }
     }
 }
 
 /// Audio output parameters.
-pub const SAMPLE_RATE: u32 = 24000;
-pub const AUDIO_CHANNELS: u16 = 1;
+pub const SAMPLE_RATE: u32 = 24_000;

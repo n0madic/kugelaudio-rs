@@ -7,6 +7,7 @@ use candle_nn::{Linear, Module, RmsNorm, VarBuilder, linear_b, rms_norm};
 /// Architecture: Linear(input_dim -> output_dim) -> RMSNorm(output_dim) -> Linear(output_dim -> output_dim)
 ///
 /// Expected VarBuilder prefix: `model.acoustic_connector.`
+#[derive(Debug)]
 pub struct SpeechConnector {
     fc1: Linear,
     norm: RmsNorm,
@@ -33,5 +34,34 @@ impl SpeechConnector {
         let x = self.fc1.forward(features)?;
         let x = self.norm.forward(&x)?;
         self.fc2.forward(&x)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::VarMap;
+
+    #[test]
+    fn test_connector_shape() {
+        let device = Device::Cpu;
+        let vmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vmap, DType::F32, &device);
+        let conn = SpeechConnector::new(64, 128, 1e-6, vb).unwrap();
+        let x = Tensor::zeros(&[1, 5, 64], DType::F32, &device).unwrap();
+        let out = conn.forward(&x).unwrap();
+        assert_eq!(out.dims(), &[1, 5, 128]);
+    }
+
+    #[test]
+    fn test_connector_single_token() {
+        let device = Device::Cpu;
+        let vmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vmap, DType::F32, &device);
+        let conn = SpeechConnector::new(32, 64, 1e-6, vb).unwrap();
+        let x = Tensor::zeros(&[1, 1, 32], DType::F32, &device).unwrap();
+        let out = conn.forward(&x).unwrap();
+        assert_eq!(out.dims(), &[1, 1, 64]);
     }
 }

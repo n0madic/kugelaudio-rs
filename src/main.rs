@@ -45,10 +45,12 @@ struct Args {
 /// Try GPU backends in order of preference, fall back to CPU.
 fn select_device(requested: Option<&str>) -> anyhow::Result<Device> {
     match requested {
-        Some("metal") => Device::new_metal(0)
-            .map_err(|e| anyhow::anyhow!("Failed to open Metal device: {e}")),
-        Some("cuda") => Device::new_cuda(0)
-            .map_err(|e| anyhow::anyhow!("Failed to open CUDA device: {e}")),
+        Some("metal") => {
+            Device::new_metal(0).map_err(|e| anyhow::anyhow!("Failed to open Metal device: {e}"))
+        }
+        Some("cuda") => {
+            Device::new_cuda(0).map_err(|e| anyhow::anyhow!("Failed to open CUDA device: {e}"))
+        }
         Some("cpu") => Ok(Device::Cpu),
         Some(other) => anyhow::bail!("Unknown device '{other}'. Use metal, cuda, or cpu."),
         None => {
@@ -71,6 +73,12 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     eprintln!("KugelAudio-RS v{}", env!("CARGO_PKG_VERSION"));
+
+    anyhow::ensure!(
+        args.cfg_scale >= 0.0,
+        "--cfg-scale must be non-negative (got {})",
+        args.cfg_scale
+    );
 
     let device = select_device(args.device.as_deref())?;
 

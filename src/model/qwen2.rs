@@ -395,8 +395,7 @@ fn make_causal_mask(
     mask.to_dtype(dtype)?
         .unsqueeze(0)?
         .unsqueeze(0)?
-        .expand((b_size, 1, tgt_len, full_len))?
-        .to_dtype(dtype)
+        .expand((b_size, 1, tgt_len, full_len))
 }
 
 // ---------------------------------------------------------------------------

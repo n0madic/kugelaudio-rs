@@ -22,10 +22,11 @@
 //!
 //! Guided logits: `neg + cfg_scale * (pos - neg)`.
 
-use candle_core::{DType, Device, IndexOp, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
 use crate::config::{DpmSolverConfig, SpecialTokens};
+use crate::error::{KugelAudioError, Result};
 use crate::model::qwen2::KvCache;
 use crate::model::weights::KugelAudioModel;
 use crate::schedule::dpm_solver::DpmSolverScheduler;
@@ -86,7 +87,7 @@ fn build_prompt_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
 
     let encoding = tokenizer
         .encode(full_text.as_str(), false)
-        .map_err(|e| candle_core::Error::Msg(format!("Tokenizer error: {e}")))?;
+        .map_err(|e| KugelAudioError::Tokenizer(e.to_string()))?;
 
     let mut ids: Vec<u32> = encoding.get_ids().to_vec();
     ids.push(SpecialTokens::default().speech_start_id);
@@ -157,22 +158,14 @@ fn apply_cfg(pos: &[f32], neg: &[f32], scale: f32) -> Vec<f32> {
 /// A single speech latent tensor with shape `[vae_dim]`.
 fn sample_speech_tokens(
     model: &KugelAudioModel,
+    scheduler: &mut DpmSolverScheduler,
     condition: &Tensor,
     neg_condition: Option<&Tensor>,
     params: &GenerationParams,
     vae_dim: usize,
     device: &Device,
 ) -> Result<Tensor> {
-    let dpm_cfg = DpmSolverConfig::from(&model.diffusion_head_config);
-    let mut scheduler = DpmSolverScheduler::new(
-        dpm_cfg.num_train_timesteps,
-        &dpm_cfg.beta_schedule,
-        &dpm_cfg.prediction_type,
-        &dpm_cfg.algorithm_type,
-        dpm_cfg.solver_order,
-        device.clone(),
-    )?;
-    scheduler.set_timesteps(params.diffusion_steps as i32);
+    scheduler.reset();
 
     // Start from Gaussian noise on CPU (avoids deterministic Metal RNG),
     // then move to the target device.
@@ -214,7 +207,7 @@ fn sample_speech_tokens(
     }
 
     // [1, 1, vae_dim] → [vae_dim]
-    speech.squeeze(0)?.squeeze(0)
+    Ok(speech.squeeze(0)?.squeeze(0)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +266,19 @@ pub fn generate(
         (None, None, 0)
     };
 
-    // 4. Autoregressive loop ------------------------------------------------
+    // 4. Build DPM-Solver++ scheduler once (reused for every speech token) --
+    let dpm_cfg = DpmSolverConfig::from(&model.diffusion_head_config);
+    let mut scheduler = DpmSolverScheduler::new(
+        dpm_cfg.num_train_timesteps,
+        &dpm_cfg.beta_schedule,
+        &dpm_cfg.prediction_type,
+        &dpm_cfg.algorithm_type,
+        dpm_cfg.solver_order,
+        device.clone(),
+    )?;
+    scheduler.set_timesteps(params.diffusion_steps as i32);
+
+    // 5. Autoregressive loop ------------------------------------------------
     let mut all_speech_latents: Vec<Tensor> = Vec::new();
     let mut generated_tokens: Vec<u32> = Vec::new();
 
@@ -302,11 +307,11 @@ pub fn generate(
                     .to_vec1::<f32>()?;
                 apply_cfg(&logits_f32, &neg_logits_f32, params.cfg_scale)
             } else {
-                logits_f32.clone()
+                logits_f32
             };
 
         // Sample the best valid token
-        let (best_token, best_logit) = sample_best_token(&guided_logits, &tokens);
+        let (best_token, _) = sample_best_token(&guided_logits, &tokens);
         generated_tokens.push(best_token);
 
         if step % 10 == 0 {
@@ -318,15 +323,11 @@ pub fn generate(
 
         // End-of-speech conditions ------------------------------------------
         if best_token == tokens.speech_end_id || best_token == tokens.eos_token_id {
-            // If diffusion logit is close to the winner and we already have
-            // some latents, generate one final latent before stopping. This
-            // mirrors the Python reference pipeline's behaviour at the boundary.
-            let diff_logit = guided_logits
-                .get(tokens.speech_diffusion_id as usize)
-                .copied()
-                .unwrap_or(f32::NEG_INFINITY);
-
-            if !all_speech_latents.is_empty() && diff_logit > best_logit - 5.0 {
+            // Always produce one final boundary latent when ending mid-speech.
+            // speech_end can fire slightly before the last phoneme is fully
+            // represented in the latent stream, so the extra diffusion step
+            // captures the trailing audio and prevents syllable clipping.
+            if !all_speech_latents.is_empty() {
                 let condition = hidden.i((.., (hidden.dim(1)? - 1).., ..))?;
                 let neg_cond = neg_hidden
                     .as_ref()
@@ -334,6 +335,7 @@ pub fn generate(
                     .transpose()?;
                 let latent = sample_speech_tokens(
                     model,
+                    &mut scheduler,
                     &condition,
                     neg_cond.as_ref(),
                     params,
@@ -355,6 +357,7 @@ pub fn generate(
 
             let latent = sample_speech_tokens(
                 model,
+                &mut scheduler,
                 &condition,
                 neg_cond.as_ref(),
                 params,
@@ -384,7 +387,10 @@ pub fn generate(
                 neg_offset += 1;
             }
         } else {
-            // Regular token: embed and forward both branches
+            // Regular token: embed and forward both branches.
+            // Both positive and negative CFG caches see the same sampled token —
+            // this keeps them synchronised.  CFG acts at the logit level (the
+            // initial prompt context differs), not the token level.
             let tok = Tensor::new(&[best_token as i64], device)?.unsqueeze(0)?;
             hidden = model.lm.forward(&tok, offset, &mut cache)?;
             offset += 1;
@@ -398,7 +404,7 @@ pub fn generate(
         }
     }
 
-    // 5. Decode all latents to audio ----------------------------------------
+    // 6. Decode all latents to audio ----------------------------------------
     let audio = decode_latents(model, &all_speech_latents, device)?;
 
     Ok(GenerationOutput {
@@ -521,5 +527,26 @@ mod tests {
         // the empty-latents guard that decode_latents checks first.
         let latents: Vec<Tensor> = vec![];
         assert!(latents.is_empty());
+    }
+
+    #[test]
+    fn test_sample_best_token_speech_end() {
+        let tokens = SpecialTokens::default();
+        let mut logits = vec![0.0f32; 200_000];
+        logits[tokens.speech_end_id as usize] = 10.0;
+        logits[tokens.speech_diffusion_id as usize] = -5.0;
+
+        let (tok, _) = sample_best_token(&logits, &tokens);
+        assert_eq!(tok, tokens.speech_end_id);
+    }
+
+    #[test]
+    fn test_apply_cfg_negative_logits() {
+        let pos = vec![-1.0_f32, -2.0];
+        let neg = vec![-3.0_f32, -4.0];
+        let guided = apply_cfg(&pos, &neg, 2.0);
+        // guided = neg + 2 * (pos - neg) = neg + 2*pos - 2*neg = 2*pos - neg
+        assert!((guided[0] - 1.0).abs() < 1e-6); // 2*(-1) - (-3) = 1
+        assert!((guided[1] - 0.0).abs() < 1e-6); // 2*(-2) - (-4) = 0
     }
 }

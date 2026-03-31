@@ -18,12 +18,12 @@ use candle_nn::{
 ///
 /// The inner conv weights are loaded from `vb.pp("conv")` which must
 /// expose the keys `weight` and, when `bias` is true, `bias`.
+#[derive(Debug)]
 pub struct SConv1d {
     conv: Conv1d,
     causal: bool,
     kernel_size: usize,
     dilation: usize,
-    _stride: usize,
 }
 
 impl SConv1d {
@@ -61,7 +61,6 @@ impl SConv1d {
             causal,
             kernel_size,
             dilation,
-            _stride: stride,
         })
     }
 
@@ -102,6 +101,7 @@ impl SConv1d {
 ///
 /// The inner convtr weights are loaded from `vb.pp("convtr")` which must
 /// expose the keys `weight` and, when `bias` is true, `bias`.
+#[derive(Debug)]
 pub struct SConvTranspose1d {
     convtr: ConvTranspose1d,
     causal: bool,
@@ -169,5 +169,56 @@ impl SConvTranspose1d {
         } else {
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::VarMap;
+
+    #[test]
+    fn test_sconv1d_causal_preserves_length() {
+        let device = Device::Cpu;
+        let vmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vmap, DType::F32, &device);
+        let conv = SConv1d::new(4, 8, 3, 1, 1, 1, true, true, vb).unwrap();
+        let x = Tensor::zeros(&[1, 4, 10], DType::F32, &device).unwrap();
+        let out = conv.forward(&x).unwrap();
+        assert_eq!(out.dims(), &[1, 8, 10]);
+    }
+
+    #[test]
+    fn test_sconv1d_noncausal_preserves_length() {
+        let device = Device::Cpu;
+        let vmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vmap, DType::F32, &device);
+        let conv = SConv1d::new(4, 8, 3, 1, 1, 1, true, false, vb).unwrap();
+        let x = Tensor::zeros(&[1, 4, 10], DType::F32, &device).unwrap();
+        let out = conv.forward(&x).unwrap();
+        assert_eq!(out.dims(), &[1, 8, 10]);
+    }
+
+    #[test]
+    fn test_sconv_transpose1d_causal_upsamples() {
+        let device = Device::Cpu;
+        let vmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vmap, DType::F32, &device);
+        let conv = SConvTranspose1d::new(8, 4, 8, 4, true, true, vb).unwrap();
+        let x = Tensor::zeros(&[1, 8, 10], DType::F32, &device).unwrap();
+        let out = conv.forward(&x).unwrap();
+        assert_eq!(out.dims(), &[1, 4, 40]);
+    }
+
+    #[test]
+    fn test_sconv1d_no_bias() {
+        let device = Device::Cpu;
+        let vmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vmap, DType::F32, &device);
+        let conv = SConv1d::new(2, 4, 5, 1, 1, 1, false, true, vb).unwrap();
+        let x = Tensor::zeros(&[1, 2, 8], DType::F32, &device).unwrap();
+        let out = conv.forward(&x).unwrap();
+        assert_eq!(out.dims(), &[1, 4, 8]);
     }
 }

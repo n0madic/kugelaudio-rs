@@ -10,6 +10,7 @@ use crate::config::AcousticTokenizerConfig;
 ///
 /// Candle's `RmsNorm` normalizes the last dimension. For NCL `[B, C, L]` input,
 /// this type transposes to `[B, L, C]`, applies norm (over C), and transposes back.
+#[derive(Debug)]
 pub struct ConvRmsNorm {
     norm: RmsNorm,
 }
@@ -38,6 +39,7 @@ impl ConvRmsNorm {
 ///
 /// Input `[B, C, L]` is transposed to `[B, L, C]`, passed through
 /// `fc1 -> GELU -> fc2`, then transposed back to `[B, C, L]`.
+#[derive(Debug)]
 pub struct Ffn {
     fc1: Linear,
     fc2: Linear,
@@ -71,6 +73,7 @@ impl Ffn {
 /// Forward pass (NCL throughout):
 /// 1. norm → depthwise SConv1d → gamma scale → residual add
 /// 2. ffn_norm → Ffn → ffn_gamma scale → residual add
+#[derive(Debug)]
 pub struct Block1d {
     norm: ConvRmsNorm,
     mixer_conv: SConv1d,
@@ -187,6 +190,7 @@ impl Block1d {
 ///
 /// The Python checkpoint uses upsample_layers[0] as the stem and
 /// upsample_layers[i+1] as the i-th upsample conv.
+#[derive(Debug)]
 pub struct AcousticDecoder {
     stem: SConv1d,
     upsample_convs: Vec<SConvTranspose1d>,
@@ -209,8 +213,12 @@ impl AcousticDecoder {
         let depths: Vec<usize> = config
             .encoder_depths
             .split('-')
-            .filter_map(|s| s.parse::<usize>().ok())
-            .collect::<Vec<_>>()
+            .map(|s| {
+                s.parse::<usize>().map_err(|e| {
+                    candle_core::Error::Msg(format!("Invalid depth '{s}' in encoder_depths: {e}"))
+                })
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?
             .into_iter()
             .rev()
             .collect();

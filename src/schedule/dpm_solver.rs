@@ -123,10 +123,9 @@ impl DpmSolverScheduler {
         self.cached_lambda.clear();
 
         for &t in &timestep_values {
-            let alpha = self.alpha_t_all[t as usize];
-            let sigma_from_alpha = ((1.0 - alpha * alpha) / (alpha * alpha)).sqrt();
-            let alpha_t_val = 1.0 / (sigma_from_alpha * sigma_from_alpha + 1.0).sqrt();
-            let sigma_t_val = sigma_from_alpha * alpha_t_val;
+            // alpha_t_all[t] = sqrt(alphas_cumprod[t])
+            let alpha_t_val = self.alpha_t_all[t as usize];
+            let sigma_t_val = (1.0 - alpha_t_val * alpha_t_val).sqrt();
             let lambda_val = alpha_t_val.ln() - sigma_t_val.ln();
 
             self.cached_alpha_t.push(alpha_t_val);
@@ -457,5 +456,77 @@ mod tests {
         }
         // Should not panic; just verify shape is preserved.
         assert_eq!(sample.dims(), &[1, 64]);
+    }
+
+    /// Smoke-test a full SDE pass with a trivial model (all-zeros prediction).
+    #[test]
+    fn test_sde_step_smoke() {
+        let device = Device::Cpu;
+        let mut sched = DpmSolverScheduler::new(
+            1000,
+            "cosine",
+            "v_prediction",
+            "sde-dpmsolver++",
+            2,
+            device.clone(),
+        )
+        .unwrap();
+        sched.set_timesteps(5);
+
+        let mut sample = Tensor::zeros(&[1, 64], DType::F32, &device).unwrap();
+        let timesteps = sched.timesteps.clone();
+        for (i, &t) in timesteps.iter().enumerate() {
+            let pred = Tensor::zeros_like(&sample).unwrap();
+            let out = sched.step(&pred, t, &sample, i).unwrap();
+            sample = out.prev_sample;
+        }
+        assert_eq!(sample.dims(), &[1, 64]);
+    }
+
+    /// Verify that reset clears model outputs but preserves timesteps.
+    #[test]
+    fn test_reset_preserves_timesteps() {
+        let device = Device::Cpu;
+        let mut sched =
+            DpmSolverScheduler::new(1000, "cosine", "v_prediction", "sde-dpmsolver++", 2, device)
+                .unwrap();
+        sched.set_timesteps(10);
+        let ts_before = sched.timesteps.clone();
+
+        // Run one step to populate model_outputs.
+        let sample = Tensor::zeros(&[1, 64], DType::F32, &sched.device.clone()).unwrap();
+        let pred = Tensor::zeros_like(&sample).unwrap();
+        let _ = sched.step(&pred, ts_before[0], &sample, 0).unwrap();
+        assert!(sched.lower_order_nums > 0);
+
+        // Reset should clear order counter but keep timesteps.
+        sched.reset();
+        assert_eq!(sched.lower_order_nums, 0);
+        assert_eq!(sched.timesteps, ts_before);
+    }
+
+    /// Verify epsilon prediction mode doesn't panic.
+    #[test]
+    fn test_epsilon_prediction() {
+        let device = Device::Cpu;
+        let mut sched = DpmSolverScheduler::new(
+            1000,
+            "cosine",
+            "epsilon",
+            "ode-dpmsolver++",
+            2,
+            device.clone(),
+        )
+        .unwrap();
+        sched.set_timesteps(5);
+
+        let mut sample = Tensor::ones(&[1, 32], DType::F32, &device).unwrap();
+        let timesteps = sched.timesteps.clone();
+        for (i, &t) in timesteps.iter().enumerate() {
+            let pred = Tensor::zeros_like(&sample).unwrap();
+            let out = sched.step(&pred, t, &sample, i).unwrap();
+            sample = out.prev_sample;
+        }
+        assert_eq!(sample.dims(), &[1, 32]);
     }
 }

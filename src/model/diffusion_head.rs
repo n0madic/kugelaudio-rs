@@ -92,8 +92,8 @@ fn timestep_embedding(t: &Tensor, dim: usize, max_period: f64) -> Result<Tensor>
 /// Architecture: sinusoidal(t, freq_size) → Linear → SiLU → Linear
 ///
 /// Weight keys (relative to this module's VarBuilder prefix):
-/// - `mlp.0.weight`, `mlp.0.bias`
-/// - `mlp.2.weight`, `mlp.2.bias`
+/// - `mlp.0.weight`
+/// - `mlp.2.weight`
 #[derive(Debug, Clone)]
 pub struct TimestepEmbedder {
     frequency_embedding_size: usize,
@@ -182,7 +182,7 @@ impl FeedForwardNetwork {
 ///
 /// Weight keys (relative to `layers.{i}`):
 /// - `norm.weight`
-/// - `adaLN_modulation.1.weight`, `adaLN_modulation.1.bias`
+/// - `adaLN_modulation.1.weight`
 /// - `ffn.gate_proj.weight`, `ffn.up_proj.weight`, `ffn.down_proj.weight`
 #[derive(Debug, Clone)]
 pub struct HeadLayer {
@@ -248,8 +248,8 @@ impl HeadLayer {
 ///
 /// Weight keys (relative to `final_layer`):
 /// - `norm.weight`  (unused at runtime — non-affine norm; loaded but ignored)
-/// - `adaLN_modulation.1.weight`, `adaLN_modulation.1.bias`
-/// - `linear.weight`, `linear.bias`
+/// - `adaLN_modulation.1.weight`
+/// - `linear.weight`
 #[derive(Debug, Clone)]
 pub struct FinalLayer {
     norm_eps: f64,
