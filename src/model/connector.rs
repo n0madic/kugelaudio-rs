@@ -1,5 +1,5 @@
 use candle_core::{Result, Tensor};
-use candle_nn::{linear_b, rms_norm, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{Linear, Module, RmsNorm, VarBuilder, linear_b, rms_norm};
 
 /// Speech connector that maps acoustic features (64-dim) into the
 /// language model's hidden space (3584-dim for 7B).

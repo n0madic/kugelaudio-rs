@@ -80,8 +80,7 @@ fn build_prompt_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     } else {
         format!("Speaker 0: {text}")
     };
-    let system_prompt =
-        " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
+    let system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
     let text_section = format!(" Text input:\n {formatted}\n Speech output:\n");
     let full_text = format!("{system_prompt}{text_section}");
 
@@ -187,11 +186,9 @@ fn sample_speech_tokens(
         let timestep_tensor = Tensor::new(&[t as f32], device)?.to_dtype(model.dtype)?;
 
         // Positive (conditioned) prediction
-        let pos_pred =
-            model
-                .prediction_head
-                .forward(&speech, condition, &timestep_tensor)?;
-
+        let pos_pred = model
+            .prediction_head
+            .forward(&speech, condition, &timestep_tensor)?;
 
         // Guided output: optionally blend with negative branch
         let guided = match neg_condition {
@@ -201,15 +198,18 @@ fn sample_speech_tokens(
                         .prediction_head
                         .forward(&speech, neg_cond, &timestep_tensor)?;
                 // guided = neg + scale * (pos - neg)
-                let diff = (pos_pred.to_dtype(DType::F32)?
-                    - neg_pred.to_dtype(DType::F32)?)?;
-                (neg_pred.to_dtype(DType::F32)?
-                    + (diff * params.cfg_scale as f64)?)?
+                let diff = (pos_pred.to_dtype(DType::F32)? - neg_pred.to_dtype(DType::F32)?)?;
+                (neg_pred.to_dtype(DType::F32)? + (diff * params.cfg_scale as f64)?)?
             }
             _ => pos_pred,
         };
 
-        let output = scheduler.step(&guided.to_dtype(DType::F32)?, t, &speech.to_dtype(DType::F32)?, i)?;
+        let output = scheduler.step(
+            &guided.to_dtype(DType::F32)?,
+            t,
+            &speech.to_dtype(DType::F32)?,
+            i,
+        )?;
         speech = output.prev_sample.to_dtype(model.dtype)?;
     }
 
@@ -261,7 +261,6 @@ pub fn generate(
     let mut hidden = model.lm.forward(&input_tensor, 0, &mut cache)?;
     let mut offset = prompt_len;
 
-
     // 3. Prefill negative branch (speech_start only) ------------------------
     // Negative branch for CFG: unconditioned (speech_start only).
     // Advanced in parallel with the positive branch.
@@ -291,21 +290,20 @@ pub fn generate(
             .to_vec1::<f32>()?;
 
         // CFG: blend with negative branch logits when applicable
-        let guided_logits = if let (Some(neg_h), true) =
-            (neg_hidden.as_ref(), params.cfg_scale > 1.0)
-        {
-            let neg_last = neg_h.i((.., (neg_h.dim(1)? - 1).., ..))?;
-            let neg_logits_f32 = model
-                .lm
-                .forward_lm_head(&neg_last)?
-                .squeeze(0)?
-                .squeeze(0)?
-                .to_dtype(DType::F32)?
-                .to_vec1::<f32>()?;
-            apply_cfg(&logits_f32, &neg_logits_f32, params.cfg_scale)
-        } else {
-            logits_f32.clone()
-        };
+        let guided_logits =
+            if let (Some(neg_h), true) = (neg_hidden.as_ref(), params.cfg_scale > 1.0) {
+                let neg_last = neg_h.i((.., (neg_h.dim(1)? - 1).., ..))?;
+                let neg_logits_f32 = model
+                    .lm
+                    .forward_lm_head(&neg_last)?
+                    .squeeze(0)?
+                    .squeeze(0)?
+                    .to_dtype(DType::F32)?
+                    .to_vec1::<f32>()?;
+                apply_cfg(&logits_f32, &neg_logits_f32, params.cfg_scale)
+            } else {
+                logits_f32.clone()
+            };
 
         // Sample the best valid token
         let (best_token, best_logit) = sample_best_token(&guided_logits, &tokens);
@@ -369,10 +367,7 @@ pub fn generate(
             // (no re-normalization — the connector learned to handle this form).
             // [vae_dim] → [1, 1, vae_dim]
             let connector_input = latent.unsqueeze(0)?.unsqueeze(0)?;
-            let acoustic_embed =
-                model
-                    .acoustic_connector
-                    .forward(&connector_input)?;
+            let acoustic_embed = model.acoustic_connector.forward(&connector_input)?;
 
             // Advance positive branch
             hidden = model
@@ -381,10 +376,10 @@ pub fn generate(
             offset += 1;
 
             // Advance negative branch with acoustic embed
-            if let (Some(nc), Some(nc_cache)) =
-                (neg_hidden.as_mut(), neg_cache.as_mut())
-            {
-                let nh = model.lm.forward_from_embeds(&acoustic_embed, neg_offset, nc_cache)?;
+            if let (Some(nc), Some(nc_cache)) = (neg_hidden.as_mut(), neg_cache.as_mut()) {
+                let nh = model
+                    .lm
+                    .forward_from_embeds(&acoustic_embed, neg_offset, nc_cache)?;
                 *nc = nh;
                 neg_offset += 1;
             }
@@ -394,9 +389,7 @@ pub fn generate(
             hidden = model.lm.forward(&tok, offset, &mut cache)?;
             offset += 1;
 
-            if let (Some(nc), Some(nc_cache)) =
-                (neg_hidden.as_mut(), neg_cache.as_mut())
-            {
+            if let (Some(nc), Some(nc_cache)) = (neg_hidden.as_mut(), neg_cache.as_mut()) {
                 let neg_tok = Tensor::new(&[best_token as i64], device)?.unsqueeze(0)?;
                 let nh = model.lm.forward(&neg_tok, neg_offset, nc_cache)?;
                 *nc = nh;
@@ -462,10 +455,7 @@ fn decode_latents(
     let audio_flat = audio_out.flatten_all()?.to_dtype(DType::F32)?;
 
     // Peak-normalize: scale so the loudest sample is at 0.95
-    let max_val = audio_flat
-        .abs()?
-        .max(0)?
-        .to_scalar::<f32>()?;
+    let max_val = audio_flat.abs()?.max(0)?.to_scalar::<f32>()?;
 
     let audio = if max_val > 1e-6 {
         (audio_flat * (0.95 / max_val) as f64)?

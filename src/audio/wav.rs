@@ -18,7 +18,10 @@ pub fn write_wav(path: impl AsRef<Path>, audio: &Tensor) -> Result<()> {
     let mut writer = WavWriter::create(path, spec)
         .map_err(|e| crate::error::KugelAudioError::Audio(format!("Failed to create WAV: {e}")))?;
 
-    let samples = audio.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let samples = audio
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
 
     for &sample in &samples {
         let clamped = sample.clamp(-1.0, 1.0);

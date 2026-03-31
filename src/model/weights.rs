@@ -57,10 +57,7 @@ struct SafetensorIndex {
 fn find_safetensor_shards(model_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     let index_path = model_dir.join("model.safetensors.index.json");
     let file = std::fs::File::open(&index_path).map_err(|e| {
-        KugelAudioError::WeightLoading(format!(
-            "Cannot open {}: {e}",
-            index_path.display()
-        ))
+        KugelAudioError::WeightLoading(format!("Cannot open {}: {e}", index_path.display()))
     })?;
 
     let index: SafetensorIndex = serde_json::from_reader(file)?;
@@ -92,12 +89,10 @@ fn find_safetensor_shards(model_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 
 fn load_config(model_dir: &Path) -> Result<KugelAudioConfig> {
     let path = model_dir.join("config.json");
-    let file = std::fs::File::open(&path).map_err(|e| {
-        KugelAudioError::Config(format!("Cannot open {}: {e}", path.display()))
-    })?;
-    serde_json::from_reader(file).map_err(|e| {
-        KugelAudioError::Config(format!("Failed to parse config.json: {e}"))
-    })
+    let file = std::fs::File::open(&path)
+        .map_err(|e| KugelAudioError::Config(format!("Cannot open {}: {e}", path.display())))?;
+    serde_json::from_reader(file)
+        .map_err(|e| KugelAudioError::Config(format!("Failed to parse config.json: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -144,10 +139,8 @@ pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> 
     } else {
         Some(vb.clone())
     };
-    let lm =
-        Qwen2Model::new(&qwen2_cfg, vb.pp("model").pp("language_model"), lm_head_vb).map_err(
-            |e| KugelAudioError::Model(format!("Failed to load language model: {e}")),
-        )?;
+    let lm = Qwen2Model::new(&qwen2_cfg, vb.pp("model").pp("language_model"), lm_head_vb)
+        .map_err(|e| KugelAudioError::Model(format!("Failed to load language model: {e}")))?;
 
     // Speech connector.
     let acoustic_connector = SpeechConnector::new(
@@ -159,11 +152,11 @@ pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> 
     .map_err(|e| KugelAudioError::Model(format!("Failed to load acoustic_connector: {e}")))?;
 
     // Diffusion prediction head.
-    let prediction_head =
-        DiffusionHead::new(&config.diffusion_head_config, vb.pp("model").pp("prediction_head"))
-            .map_err(|e| {
-                KugelAudioError::Model(format!("Failed to load prediction_head: {e}"))
-            })?;
+    let prediction_head = DiffusionHead::new(
+        &config.diffusion_head_config,
+        vb.pp("model").pp("prediction_head"),
+    )
+    .map_err(|e| KugelAudioError::Model(format!("Failed to load prediction_head: {e}")))?;
 
     // Acoustic decoder.
     let acoustic_decoder = AcousticDecoder::load(
@@ -175,9 +168,7 @@ pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> 
     // Scalar buffers stored as 0-d tensors in the checkpoint.
     let speech_scaling_factor = vb
         .get(&[], "model.speech_scaling_factor")
-        .map_err(|e| {
-            KugelAudioError::WeightLoading(format!("speech_scaling_factor missing: {e}"))
-        })?
+        .map_err(|e| KugelAudioError::WeightLoading(format!("speech_scaling_factor missing: {e}")))?
         .to_dtype(DType::F32)
         .and_then(|t| t.to_scalar::<f32>())
         .map_err(|e| {
@@ -186,9 +177,7 @@ pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> 
 
     let speech_bias_factor = vb
         .get(&[], "model.speech_bias_factor")
-        .map_err(|e| {
-            KugelAudioError::WeightLoading(format!("speech_bias_factor missing: {e}"))
-        })?
+        .map_err(|e| KugelAudioError::WeightLoading(format!("speech_bias_factor missing: {e}")))?
         .to_dtype(DType::F32)
         .and_then(|t| t.to_scalar::<f32>())
         .map_err(|e| {

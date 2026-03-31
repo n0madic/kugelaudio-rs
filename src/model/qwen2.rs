@@ -38,9 +38,9 @@
 //! let logits = model.forward_lm_head(&hidden.i((.., seq_len - 1, ..))?)?;
 //! ```
 
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{
-    embedding, linear, linear_no_bias, rms_norm, Embedding, Linear, Module, RmsNorm, VarBuilder,
+    Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear, linear_no_bias, rms_norm,
 };
 use std::sync::Arc;
 
@@ -175,7 +175,10 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(xs)?.apply(&candle_nn::Activation::Silu)?;
+        let gate = self
+            .gate_proj
+            .forward(xs)?
+            .apply(&candle_nn::Activation::Silu)?;
         let up = self.up_proj.forward(xs)?;
         (gate * up)?.apply(&self.down_proj)
     }
@@ -339,12 +342,17 @@ impl DecoderLayer {
         // Pre-norm self-attention with residual
         let residual = xs;
         let normed = self.input_layernorm.forward(xs)?;
-        let attn_out = self.self_attn.forward(&normed, mask, seqlen_offset, kv_cache)?;
+        let attn_out = self
+            .self_attn
+            .forward(&normed, mask, seqlen_offset, kv_cache)?;
         let xs = (attn_out + residual)?;
 
         // Pre-norm MLP with residual
         let residual = &xs;
-        let mlp_out = self.post_attention_layernorm.forward(&xs)?.apply(&self.mlp)?;
+        let mlp_out = self
+            .post_attention_layernorm
+            .forward(&xs)?
+            .apply(&self.mlp)?;
         residual + mlp_out
     }
 }
@@ -383,9 +391,7 @@ fn make_causal_mask(
     let full_len = tgt_len + seqlen_offset;
     // Upper-triangular (future) positions in the tgt_len × tgt_len block
     let mask_vals: Vec<f32> = (0..tgt_len)
-        .flat_map(|i| {
-            (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0.0_f32 })
-        })
+        .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0.0_f32 }))
         .collect();
     let mask = Tensor::from_slice(&mask_vals, (tgt_len, tgt_len), device)?;
 
@@ -453,7 +459,11 @@ impl Qwen2Model {
         let lm_head = if cfg.tie_word_embeddings {
             None
         } else if let Some(lm_vb) = lm_head_vb {
-            Some(linear_no_bias(cfg.hidden_size, cfg.vocab_size, lm_vb.pp("lm_head"))?)
+            Some(linear_no_bias(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                lm_vb.pp("lm_head"),
+            )?)
         } else {
             None
         };
@@ -493,7 +503,13 @@ impl Qwen2Model {
 
         // Build causal mask only during prefill (seq_len > 1).
         let mask = if seq_len > 1 {
-            Some(make_causal_mask(b_size, seq_len, seqlen_offset, self.dtype, &self.device)?)
+            Some(make_causal_mask(
+                b_size,
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
         } else {
             None
         };

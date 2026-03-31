@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use clap::Parser;
 use candle_core::Device;
+use clap::Parser;
 
 use kugelaudio_rs::audio::wav;
-use kugelaudio_rs::config::{SpecialTokens, SAMPLE_RATE};
+use kugelaudio_rs::config::{SAMPLE_RATE, SpecialTokens};
 use kugelaudio_rs::generation::pipeline::{self, GenerationParams};
 use kugelaudio_rs::model::weights;
 
@@ -48,14 +48,15 @@ fn main() -> anyhow::Result<()> {
     eprintln!("KugelAudio-RS v{}", env!("CARGO_PKG_VERSION"));
 
     // Select compute device.
-    let device = match args.device.as_str() {
-        "cpu" => Device::Cpu,
-        "metal" => Device::new_metal(0)
-            .map_err(|e| anyhow::anyhow!("Failed to open Metal device: {e}"))?,
-        "cuda" => Device::new_cuda(0)
-            .map_err(|e| anyhow::anyhow!("Failed to open CUDA device: {e}"))?,
-        other => anyhow::bail!("Unknown device '{}'. Use cpu, metal, or cuda.", other),
-    };
+    let device =
+        match args.device.as_str() {
+            "cpu" => Device::Cpu,
+            "metal" => Device::new_metal(0)
+                .map_err(|e| anyhow::anyhow!("Failed to open Metal device: {e}"))?,
+            "cuda" => Device::new_cuda(0)
+                .map_err(|e| anyhow::anyhow!("Failed to open CUDA device: {e}"))?,
+            other => anyhow::bail!("Unknown device '{}'. Use cpu, metal, or cuda.", other),
+        };
 
     // Load model weights.
     eprintln!("Loading model from {}...", args.model_path);

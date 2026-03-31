@@ -1,5 +1,5 @@
 use candle_core::{Result, Tensor};
-use candle_nn::{activation::Activation, linear_b, rms_norm, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{Linear, Module, RmsNorm, VarBuilder, activation::Activation, linear_b, rms_norm};
 
 use super::causal_conv::{SConv1d, SConvTranspose1d};
 use crate::config::AcousticTokenizerConfig;
@@ -91,7 +91,13 @@ impl Block1d {
     /// - `ffn_norm.weight` — FFN RmsNorm
     /// - `ffn.fc1.{weight,bias}`, `ffn.fc2.{weight,bias}`
     /// - `ffn_gamma` — `[channels]` FFN layer scale (optional)
-    pub fn load(channels: usize, kernel_size: usize, eps: f64, causal: bool, vb: VarBuilder) -> Result<Self> {
+    pub fn load(
+        channels: usize,
+        kernel_size: usize,
+        eps: f64,
+        causal: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let norm = ConvRmsNorm::load(channels, eps, vb.pp("norm"))?;
 
         // Depthwise conv: groups == channels.

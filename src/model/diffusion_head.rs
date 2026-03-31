@@ -23,8 +23,8 @@
 //! let output = head.forward(&noisy, &condition, &timesteps)?;
 //! ```
 
-use candle_core::{DType, Result, Tensor, D};
-use candle_nn::{linear_no_bias, rms_norm, Linear, Module, RmsNorm, VarBuilder};
+use candle_core::{D, DType, Result, Tensor};
+use candle_nn::{Linear, Module, RmsNorm, VarBuilder, linear_no_bias, rms_norm};
 
 use crate::config::DiffusionHeadConfig;
 
@@ -111,7 +111,11 @@ pub struct TimestepEmbedder {
 
 impl TimestepEmbedder {
     /// `vb` must be scoped to `t_embedder`.
-    pub fn new(hidden_size: usize, frequency_embedding_size: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        hidden_size: usize,
+        frequency_embedding_size: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let vb_mlp = vb.pp("mlp");
         // PyTorch nn.Sequential uses numeric string keys: 0, 1 (activation), 2
         let mlp_linear1 = linear_no_bias(frequency_embedding_size, hidden_size, vb_mlp.pp(0))?;
@@ -165,7 +169,10 @@ impl FeedForwardNetwork {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?.apply(&candle_nn::Activation::Silu)?;
+        let gate = self
+            .gate_proj
+            .forward(x)?
+            .apply(&candle_nn::Activation::Silu)?;
         let up = self.up_proj.forward(x)?;
         (gate * up)?.apply(&self.down_proj)
     }
@@ -195,11 +202,21 @@ pub struct HeadLayer {
 }
 
 impl HeadLayer {
-    fn new(embed_dim: usize, ffn_dim: usize, cond_dim: usize, norm_eps: f64, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        embed_dim: usize,
+        ffn_dim: usize,
+        cond_dim: usize,
+        norm_eps: f64,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         Ok(Self {
             norm: rms_norm(embed_dim, norm_eps, vb.pp("norm"))?,
             // nn.Sequential(nn.SiLU(), nn.Linear(...)) — index 1 is the Linear
-            ada_ln_linear: linear_no_bias(cond_dim, 3 * embed_dim, vb.pp("adaLN_modulation").pp(1))?,
+            ada_ln_linear: linear_no_bias(
+                cond_dim,
+                3 * embed_dim,
+                vb.pp("adaLN_modulation").pp(1),
+            )?,
             ffn: FeedForwardNetwork::new(embed_dim, ffn_dim, vb.pp("ffn"))?,
         })
     }
@@ -214,7 +231,9 @@ impl HeadLayer {
     /// `[B, T, embed_dim]` updated hidden states.
     fn forward(&self, x: &Tensor, c: &Tensor) -> Result<Tensor> {
         // AdaLN: SiLU(c) → linear → split into (shift, scale, gate)
-        let modulation = self.ada_ln_linear.forward(&c.apply(&candle_nn::Activation::Silu)?)?;
+        let modulation = self
+            .ada_ln_linear
+            .forward(&c.apply(&candle_nn::Activation::Silu)?)?;
         let chunks = modulation.chunk(3, D::Minus1)?;
         let (shift, scale, gate) = (&chunks[0], &chunks[1], &chunks[2]);
 
@@ -256,7 +275,11 @@ impl FinalLayer {
     ) -> Result<Self> {
         Ok(Self {
             norm_eps,
-            ada_ln_linear: linear_no_bias(cond_size, 2 * hidden_size, vb.pp("adaLN_modulation").pp(1))?,
+            ada_ln_linear: linear_no_bias(
+                cond_size,
+                2 * hidden_size,
+                vb.pp("adaLN_modulation").pp(1),
+            )?,
             linear: linear_no_bias(hidden_size, output_dim, vb.pp("linear"))?,
         })
     }
@@ -271,7 +294,9 @@ impl FinalLayer {
     /// `[B, T, output_dim]`
     fn forward(&self, x: &Tensor, c: &Tensor) -> Result<Tensor> {
         // AdaLN: SiLU(c) → linear → split into (shift, scale)
-        let modulation = self.ada_ln_linear.forward(&c.apply(&candle_nn::Activation::Silu)?)?;
+        let modulation = self
+            .ada_ln_linear
+            .forward(&c.apply(&candle_nn::Activation::Silu)?)?;
         let chunks = modulation.chunk(2, D::Minus1)?;
         let (shift, scale) = (&chunks[0], &chunks[1]);
 
@@ -333,10 +358,22 @@ impl DiffusionHead {
 
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            layers.push(HeadLayer::new(hidden_size, ffn_dim, hidden_size, norm_eps, vb.pp("layers").pp(i))?);
+            layers.push(HeadLayer::new(
+                hidden_size,
+                ffn_dim,
+                hidden_size,
+                norm_eps,
+                vb.pp("layers").pp(i),
+            )?);
         }
 
-        let final_layer = FinalLayer::new(hidden_size, input_dim, hidden_size, norm_eps, vb.pp("final_layer"))?;
+        let final_layer = FinalLayer::new(
+            hidden_size,
+            input_dim,
+            hidden_size,
+            norm_eps,
+            vb.pp("final_layer"),
+        )?;
 
         Ok(Self {
             noisy_images_proj,

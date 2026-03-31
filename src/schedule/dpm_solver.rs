@@ -449,9 +449,15 @@ mod tests {
     #[test]
     fn test_ode_step_smoke() {
         let device = Device::Cpu;
-        let mut sched =
-            DpmSolverScheduler::new(1000, "cosine", "v_prediction", "ode-dpmsolver++", 2, device.clone())
-                .unwrap();
+        let mut sched = DpmSolverScheduler::new(
+            1000,
+            "cosine",
+            "v_prediction",
+            "ode-dpmsolver++",
+            2,
+            device.clone(),
+        )
+        .unwrap();
         sched.set_timesteps(5);
 
         let mut sample = Tensor::zeros(&[1, 64], DType::F32, &device).unwrap();
