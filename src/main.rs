@@ -37,9 +37,9 @@ struct Args {
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Quantize LM to 4-bit at runtime (use convert-quantized for pre-quantized weights)
+    /// Quantize LM at runtime to N bits (4 or 8). Use convert-quantized for pre-quantized weights.
     #[arg(long)]
-    quantize: bool,
+    quantize: Option<i32>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -49,8 +49,8 @@ fn main() -> anyhow::Result<()> {
     eprintln!("Loading model from {}...", args.model_path);
 
     let mut model = weights::load_model(&args.model_path)?;
-    if args.quantize {
-        model.quantize_lm(64, 4)?;
+    if let Some(bits) = args.quantize {
+        model.quantize_lm(64, bits)?;
     }
     eprintln!("Model loaded.");
 
