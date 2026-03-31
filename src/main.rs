@@ -40,6 +40,10 @@ struct Args {
     /// Compute device: "metal", "cuda", or "cpu" (default: auto-detect best available)
     #[arg(long)]
     device: Option<String>,
+
+    /// Number of samples to generate (output files are named <stem>_1.wav, <stem>_2.wav, ...)
+    #[arg(long, default_value_t = 1)]
+    count: u32,
 }
 
 /// Try GPU backends in order of preference, fall back to CPU.
@@ -101,30 +105,53 @@ fn main() -> anyhow::Result<()> {
         diffusion_steps: args.diffusion_steps,
     };
 
-    // Run the pipeline.
-    eprintln!("Generating: \"{}\"", args.text);
-    let output = pipeline::generate(&model, &tokenizer, &args.text, &params)
-        .map_err(|e| anyhow::anyhow!("Generation failed: {e}"))?;
+    anyhow::ensure!(args.count >= 1, "--count must be at least 1");
 
-    // Write output WAV.
-    if let Some(audio) = &output.audio {
-        wav::write_wav(&args.output, audio)
-            .map_err(|e| anyhow::anyhow!("WAV write failed: {e}"))?;
+    let output_path = Path::new(&args.output);
+    let stem = output_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let ext = output_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let parent = output_path.parent().unwrap_or(Path::new(""));
 
-        let tokens = SpecialTokens::default();
-        let n_speech = output
-            .sequences
-            .iter()
-            .filter(|&&t| t == tokens.speech_diffusion_id)
-            .count();
-        // Each speech token covers ~3200 samples at 24 kHz (≈ 133 ms).
-        let duration_s = n_speech as f32 * 3200.0 / SAMPLE_RATE as f32;
-        eprintln!(
-            "Saved {} ({duration_s:.1}s, {n_speech} speech tokens)",
-            args.output
-        );
-    } else {
-        eprintln!("No audio generated (no speech_diffusion tokens produced).");
+    for i in 1..=args.count {
+        let out_file = if args.count > 1 {
+            parent
+                .join(format!("{stem}_{i}{ext}"))
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            args.output.clone()
+        };
+
+        eprintln!("Generating sample {}/{}: \"{}\"", i, args.count, args.text);
+        let output = pipeline::generate(&model, &tokenizer, &args.text, &params)
+            .map_err(|e| anyhow::anyhow!("Generation failed (sample {i}): {e}"))?;
+
+        if let Some(audio) = &output.audio {
+            wav::write_wav(&out_file, audio)
+                .map_err(|e| anyhow::anyhow!("WAV write failed (sample {i}): {e}"))?;
+
+            let tokens = SpecialTokens::default();
+            let n_speech = output
+                .sequences
+                .iter()
+                .filter(|&&t| t == tokens.speech_diffusion_id)
+                .count();
+            // Each speech token covers ~3200 samples at 24 kHz (≈ 133 ms).
+            let duration_s = n_speech as f32 * 3200.0 / SAMPLE_RATE as f32;
+            eprintln!(
+                "Saved {} ({duration_s:.1}s, {n_speech} speech tokens)",
+                out_file
+            );
+        } else {
+            eprintln!("No audio generated for sample {i} (no speech_diffusion tokens produced).");
+        }
     }
 
     Ok(())

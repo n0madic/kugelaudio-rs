@@ -54,6 +54,16 @@ cargo build --release
   --output hello.wav
 ```
 
+Generate multiple samples at once (outputs `hello_1.wav`, `hello_2.wav`, `hello_3.wav`):
+
+```bash
+./target/release/kugelaudio-rs \
+  --model-path /tmp/kugelaudio_model \
+  --text "Hello world" \
+  --output hello.wav \
+  --count 3
+```
+
 The device is auto-detected (CUDA > Metal > CPU). Override with `--device`:
 
 ```bash
@@ -71,6 +81,7 @@ The device is auto-detected (CUDA > Metal > CPU). Override with `--device`:
 | `--max-tokens` | `2048` | Maximum autoregressive tokens |
 | `--diffusion-steps` | `10` | DPM-Solver++ steps per speech token |
 | `--device` | auto | `metal`, `cuda`, or `cpu` |
+| `--count` | `1` | Number of samples to generate; output files are named `<stem>_1.wav`, `<stem>_2.wav`, … |
 
 ## Requirements
 
