@@ -1,332 +1,342 @@
-use mlx_rs::{
-    array,
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    ops::{
-        concatenate_axis, cos, exp,
-        indexing::{IndexOp, NewAxis},
-        multiply, rsqrt, sin,
-    },
-    Array,
-};
+//! Diffusion prediction head for KugelAudio.
+//!
+//! Predicts the speech latent noise from noisy input, LM conditioning, and a
+//! diffusion timestep. The architecture is a small feed-forward DiT with
+//! Adaptive Layer Norm (AdaLN) modulation.
+//!
+//! # Architecture
+//!
+//! 1. **Projections**: noisy latent → hidden_size, condition → hidden_size.
+//! 2. **TimestepEmbedder**: sinusoidal encoding → Linear → SiLU → Linear.
+//! 3. **HeadLayer ×N**: AdaLN modulation + SwiGLU FFN with residual connection.
+//! 4. **FinalLayer**: AdaLN modulation → linear projection to output_dim.
+//!
+//! # Weight key prefix
+//!
+//! The parent [`VarBuilder`] must be scoped to `model.prediction_head.`.
+//!
+//! # Example
+//!
+//! ```ignore
+//! let vb = vb.pp("model").pp("prediction_head");
+//! let head = DiffusionHead::new(&cfg.diffusion_head_config, vb)?;
+//! let output = head.forward(&noisy, &condition, &timesteps)?;
+//! ```
+
+use candle_core::{DType, Result, Tensor, D};
+use candle_nn::{linear_no_bias, rms_norm, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::config::DiffusionHeadConfig;
 
-// ---- RMSNorm without learnable weight (affine=False) ----
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-fn rms_norm_no_affine(x: &Array, eps: f32) -> Result<Array, Exception> {
-    let x_f32 = x.as_type::<f32>()?;
-    let sq = x_f32.power(&array!(2.0f32))?;
-    let mean_sq = sq.mean_axes(&[-1], true)?;
-    let norm = rsqrt(&mean_sq.add(array!(eps))?)?;
-    let out = x_f32.multiply(&norm)?;
-    out.as_dtype(x.dtype())
+/// RmsNorm without learnable affine parameters (affine=False).
+///
+/// Normalises over the last dimension using RMS, scaled by `eps` for stability.
+fn rms_norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
+    let x_normed = x.broadcast_div(&(variance + eps)?.sqrt()?)?;
+    Ok(x_normed)
 }
 
-// ---- Modulation: x * (1 + scale) + shift ----
-
-fn modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array, Exception> {
-    let scaled = x.multiply(&scale.add(array!(1.0f32))?)?;
-    scaled.add(shift)
+/// Adaptive layer norm modulation: `x * (1 + scale) + shift`.
+///
+/// `shift` and `scale` are broadcast over the sequence dimension.
+fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)
 }
 
-// ---- Sinusoidal timestep embeddings ----
-
-fn timestep_embedding(t: &Array, dim: i32, max_period: f32) -> Result<Array, Exception> {
+/// Sinusoidal timestep embedding.
+///
+/// Maps a batch of scalar timesteps to `[batch, dim]` frequency features.
+///
+/// # Arguments
+///
+/// * `t`          – `[batch]` timestep tensor (f32)
+/// * `dim`        – embedding dimension
+/// * `max_period` – controls the range of frequencies (default 10_000.0)
+fn timestep_embedding(t: &Tensor, dim: usize, max_period: f64) -> Result<Tensor> {
     let half = dim / 2;
+    let device = t.device();
+    let orig_dtype = t.dtype();
 
-    // freqs = exp(-log(max_period) * arange(half) / half)
-    let arange = Array::from_iter(0..half, &[half]).as_type::<f32>()?;
-    let log_period = array!(-f32::ln(max_period));
-    let freqs = exp(&multiply(
-        &log_period,
-        &arange.divide(&array!(half as f32))?,
-    )?)?;
+    // Compute in F32 for precision
+    let t_f32 = t.to_dtype(DType::F32)?;
 
-    // args = t[:, None] * freqs[None, :]
-    let t_expanded = t.index((.., NewAxis)).as_type::<f32>()?;
-    let freqs_expanded = freqs.index((NewAxis,));
-    let args = t_expanded.multiply(&freqs_expanded)?;
+    // freqs[i] = exp(-log(max_period) * i / half)
+    let freqs: Vec<f32> = (0..half)
+        .map(|i| (-(max_period.ln()) * i as f64 / half as f64).exp() as f32)
+        .collect();
+    let freqs = Tensor::from_vec(freqs, (1, half), device)?;
 
-    let cos_part = cos(&args)?;
-    let sin_part = sin(&args)?;
-    let embedding = concatenate_axis(&[&cos_part, &sin_part], -1)?;
+    // args: [batch, half] = t[:, None] * freqs[None, :]
+    let t_f32 = t_f32.unsqueeze(1)?;
+    let args = t_f32.broadcast_mul(&freqs)?;
 
-    if dim % 2 != 0 {
-        let batch = embedding.dim(0);
-        let pad = Array::zeros::<f32>(&[batch, 1])?;
-        concatenate_axis(&[&embedding, &pad], -1)
+    let cos_part = args.cos()?;
+    let sin_part = args.sin()?;
+
+    // Concatenate along last dim → [batch, dim] (or [batch, dim+1] if odd)
+    let embedding = Tensor::cat(&[cos_part, sin_part], D::Minus1)?;
+
+    let embedding = if dim % 2 != 0 {
+        let (b, _) = embedding.dims2()?;
+        let pad = Tensor::zeros((b, 1), embedding.dtype(), device)?;
+        Tensor::cat(&[embedding, pad], D::Minus1)?
     } else {
-        Ok(embedding)
-    }
+        embedding
+    };
+    embedding.to_dtype(orig_dtype)
 }
 
-// ---- TimestepEmbedder ----
+// ---------------------------------------------------------------------------
+// TimestepEmbedder
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+/// Two-layer MLP that turns a scalar timestep into a hidden-size embedding.
+///
+/// Architecture: sinusoidal(t, freq_size) → Linear → SiLU → Linear
+///
+/// Weight keys (relative to this module's VarBuilder prefix):
+/// - `mlp.0.weight`, `mlp.0.bias`
+/// - `mlp.2.weight`, `mlp.2.bias`
+#[derive(Debug, Clone)]
 pub struct TimestepEmbedder {
-    pub frequency_embedding_size: i32,
-    #[param]
-    pub linear1: nn::Linear,
-    #[param]
-    pub linear2: nn::Linear,
+    frequency_embedding_size: usize,
+    mlp_linear1: Linear,
+    mlp_linear2: Linear,
 }
 
 impl TimestepEmbedder {
-    pub fn new(hidden_size: i32, frequency_embedding_size: i32) -> Result<Self, Exception> {
-        let linear1 = nn::LinearBuilder::new(frequency_embedding_size, hidden_size)
-            .bias(false)
-            .build()?;
-        let linear2 = nn::LinearBuilder::new(hidden_size, hidden_size)
-            .bias(false)
-            .build()?;
+    /// `vb` must be scoped to `t_embedder`.
+    pub fn new(hidden_size: usize, frequency_embedding_size: usize, vb: VarBuilder) -> Result<Self> {
+        let vb_mlp = vb.pp("mlp");
+        // PyTorch nn.Sequential uses numeric string keys: 0, 1 (activation), 2
+        let mlp_linear1 = linear_no_bias(frequency_embedding_size, hidden_size, vb_mlp.pp(0))?;
+        let mlp_linear2 = linear_no_bias(hidden_size, hidden_size, vb_mlp.pp(2))?;
 
         Ok(Self {
             frequency_embedding_size,
-            linear1,
-            linear2,
+            mlp_linear1,
+            mlp_linear2,
         })
     }
-}
 
-impl Module<&Array> for TimestepEmbedder {
-    type Output = Array;
-    type Error = Exception;
-
-    fn forward(&mut self, t: &Array) -> Result<Self::Output, Self::Error> {
-        let t_freq = timestep_embedding(t, self.frequency_embedding_size, 10000.0)?;
-        let x = self.linear1.forward(&t_freq)?;
-        let x = nn::silu(&x)?;
-        self.linear2.forward(&x)
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.linear1.training_mode(mode);
-        self.linear2.training_mode(mode);
+    /// # Arguments
+    ///
+    /// * `t` – `[batch]` timesteps as f32
+    ///
+    /// # Returns
+    ///
+    /// `[batch, hidden_size]` timestep embedding.
+    pub fn forward(&self, t: &Tensor) -> Result<Tensor> {
+        let freq = timestep_embedding(t, self.frequency_embedding_size, 10_000.0)?;
+        let x = self.mlp_linear1.forward(&freq)?;
+        let x = x.apply(&candle_nn::Activation::Silu)?;
+        self.mlp_linear2.forward(&x)
     }
 }
 
-// ---- FeedForwardNetwork (SwiGLU) ----
+// ---------------------------------------------------------------------------
+// FeedForwardNetwork (SwiGLU)
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
-pub struct FeedForwardNetwork {
-    #[param]
-    pub gate_proj: nn::Linear,
-    #[param]
-    pub up_proj: nn::Linear,
-    #[param]
-    pub down_proj: nn::Linear,
+/// SwiGLU feed-forward network.
+///
+/// `down_proj( silu(gate_proj(x)) * up_proj(x) )`
+///
+/// All projections have no bias.
+#[derive(Debug, Clone)]
+struct FeedForwardNetwork {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
 }
 
 impl FeedForwardNetwork {
-    pub fn new(embed_dim: i32, ffn_dim: i32) -> Result<Self, Exception> {
-        let gate_proj = nn::LinearBuilder::new(embed_dim, ffn_dim)
-            .bias(false)
-            .build()?;
-        let up_proj = nn::LinearBuilder::new(embed_dim, ffn_dim)
-            .bias(false)
-            .build()?;
-        let down_proj = nn::LinearBuilder::new(ffn_dim, embed_dim)
-            .bias(false)
-            .build()?;
-
+    fn new(embed_dim: usize, ffn_dim: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
+            gate_proj: linear_no_bias(embed_dim, ffn_dim, vb.pp("gate_proj"))?,
+            up_proj: linear_no_bias(embed_dim, ffn_dim, vb.pp("up_proj"))?,
+            down_proj: linear_no_bias(ffn_dim, embed_dim, vb.pp("down_proj"))?,
         })
     }
-}
 
-impl Module<&Array> for FeedForwardNetwork {
-    type Output = Array;
-    type Error = Exception;
-
-    fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
-        let gate = nn::silu(&self.gate_proj.forward(x)?)?;
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward(x)?.apply(&candle_nn::Activation::Silu)?;
         let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&gate.multiply(&up)?)
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.gate_proj.training_mode(mode);
-        self.up_proj.training_mode(mode);
-        self.down_proj.training_mode(mode);
+        (gate * up)?.apply(&self.down_proj)
     }
 }
 
-// ---- HeadLayer (with AdaLN modulation) ----
+// ---------------------------------------------------------------------------
+// HeadLayer
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+/// Single diffusion head layer with AdaLN modulation and SwiGLU FFN.
+///
+/// The conditioning signal `c` modulates the normalised hidden state via a
+/// learned linear projection that produces `(shift, scale, gate)` triplets.
+/// The residual update is: `x + gate * ffn(modulate(norm(x), shift, scale))`.
+///
+/// Weight keys (relative to `layers.{i}`):
+/// - `norm.weight`
+/// - `adaLN_modulation.1.weight`, `adaLN_modulation.1.bias`
+/// - `ffn.gate_proj.weight`, `ffn.up_proj.weight`, `ffn.down_proj.weight`
+#[derive(Debug, Clone)]
 pub struct HeadLayer {
-    #[param]
-    pub ffn: FeedForwardNetwork,
-    #[param]
-    pub norm: nn::RmsNorm,
-    /// AdaLN modulation: SiLU -> Linear(cond_dim -> 3 * embed_dim)
-    #[param]
-    pub ada_ln_linear: nn::Linear,
+    norm: RmsNorm,
+    /// Linear(cond_dim → 3 * embed_dim) after the SiLU activation.
+    /// Checkpoint key suffix: `adaLN_modulation.1.*` (index 1 in nn.Sequential).
+    ada_ln_linear: Linear,
+    ffn: FeedForwardNetwork,
 }
 
 impl HeadLayer {
-    pub fn new(
-        embed_dim: i32,
-        ffn_dim: i32,
-        cond_dim: i32,
-        norm_eps: f32,
-    ) -> Result<Self, Exception> {
-        let ffn = FeedForwardNetwork::new(embed_dim, ffn_dim)?;
-        let norm = nn::RmsNormBuilder::new(embed_dim).eps(norm_eps).build()?;
-        let ada_ln_linear = nn::LinearBuilder::new(cond_dim, 3 * embed_dim)
-            .bias(false)
-            .build()?;
-
+    fn new(embed_dim: usize, ffn_dim: usize, cond_dim: usize, norm_eps: f64, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            ffn,
-            norm,
-            ada_ln_linear,
+            norm: rms_norm(embed_dim, norm_eps, vb.pp("norm"))?,
+            // nn.Sequential(nn.SiLU(), nn.Linear(...)) — index 1 is the Linear
+            ada_ln_linear: linear_no_bias(cond_dim, 3 * embed_dim, vb.pp("adaLN_modulation").pp(1))?,
+            ffn: FeedForwardNetwork::new(embed_dim, ffn_dim, vb.pp("ffn"))?,
         })
     }
-}
 
-/// Input for HeadLayer: (x, condition)
-pub struct HeadLayerInput<'a> {
-    pub x: &'a Array,
-    pub c: &'a Array,
-}
+    /// # Arguments
+    ///
+    /// * `x` – `[B, T, embed_dim]` hidden states
+    /// * `c` – `[B, T, cond_dim]` condition (already summed with timestep embed)
+    ///
+    /// # Returns
+    ///
+    /// `[B, T, embed_dim]` updated hidden states.
+    fn forward(&self, x: &Tensor, c: &Tensor) -> Result<Tensor> {
+        // AdaLN: SiLU(c) → linear → split into (shift, scale, gate)
+        let modulation = self.ada_ln_linear.forward(&c.apply(&candle_nn::Activation::Silu)?)?;
+        let chunks = modulation.chunk(3, D::Minus1)?;
+        let (shift, scale, gate) = (&chunks[0], &chunks[1], &chunks[2]);
 
-impl Module<HeadLayerInput<'_>> for HeadLayer {
-    type Output = Array;
-    type Error = Exception;
-
-    fn forward(&mut self, input: HeadLayerInput<'_>) -> Result<Self::Output, Self::Error> {
-        let HeadLayerInput { x, c } = input;
-
-        // AdaLN modulation: SiLU(c) -> Linear -> split into 3 chunks
-        let modulation = self.ada_ln_linear.forward(&nn::silu(c)?)?;
-        let chunks = modulation.split(3, -1)?;
-        let (shift_ffn, scale_ffn, gate_ffn) = (&chunks[0], &chunks[1], &chunks[2]);
-
-        // x = x + gate * ffn(modulate(norm(x), shift, scale))
+        // Residual: x + gate * ffn(modulate(norm(x), shift, scale))
         let normed = self.norm.forward(x)?;
-        let modulated = modulate(&normed, shift_ffn, scale_ffn)?;
+        let modulated = modulate(&normed, shift, scale)?;
         let ffn_out = self.ffn.forward(&modulated)?;
-        let gated = gate_ffn.multiply(&ffn_out)?;
-        x.add(gated)
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.ffn.training_mode(mode);
-        self.norm.training_mode(mode);
-        self.ada_ln_linear.training_mode(mode);
+        x + gate.broadcast_mul(&ffn_out)?
     }
 }
 
-// ---- FinalLayer ----
+// ---------------------------------------------------------------------------
+// FinalLayer
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+/// Output projection layer with AdaLN modulation (no learnable norm scale).
+///
+/// Uses a parameter-free RmsNorm followed by modulation with `(shift, scale)`
+/// and a final linear projection to `output_dim`.
+///
+/// Weight keys (relative to `final_layer`):
+/// - `norm.weight`  (unused at runtime — non-affine norm; loaded but ignored)
+/// - `adaLN_modulation.1.weight`, `adaLN_modulation.1.bias`
+/// - `linear.weight`, `linear.bias`
+#[derive(Debug, Clone)]
 pub struct FinalLayer {
-    /// RMSNorm without learnable weight (affine=False)
-    pub norm_eps: f32,
-    #[param]
-    pub linear: nn::Linear,
-    /// AdaLN modulation: SiLU -> Linear(cond_size -> 2 * hidden_size)
-    #[param]
-    pub ada_ln_linear: nn::Linear,
+    norm_eps: f64,
+    ada_ln_linear: Linear,
+    linear: Linear,
 }
 
 impl FinalLayer {
-    pub fn new(
-        hidden_size: i32,
-        output_size: i32,
-        cond_size: i32,
-        norm_eps: f32,
-    ) -> Result<Self, Exception> {
-        let linear = nn::LinearBuilder::new(hidden_size, output_size)
-            .bias(false)
-            .build()?;
-        let ada_ln_linear = nn::LinearBuilder::new(cond_size, 2 * hidden_size)
-            .bias(false)
-            .build()?;
-
+    fn new(
+        hidden_size: usize,
+        output_dim: usize,
+        cond_size: usize,
+        norm_eps: f64,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         Ok(Self {
             norm_eps,
-            linear,
-            ada_ln_linear,
+            ada_ln_linear: linear_no_bias(cond_size, 2 * hidden_size, vb.pp("adaLN_modulation").pp(1))?,
+            linear: linear_no_bias(hidden_size, output_dim, vb.pp("linear"))?,
         })
     }
-}
 
-impl Module<HeadLayerInput<'_>> for FinalLayer {
-    type Output = Array;
-    type Error = Exception;
-
-    fn forward(&mut self, input: HeadLayerInput<'_>) -> Result<Self::Output, Self::Error> {
-        let HeadLayerInput { x, c } = input;
-
-        // AdaLN modulation: SiLU(c) -> Linear -> split into 2 chunks
-        let modulation = self.ada_ln_linear.forward(&nn::silu(c)?)?;
-        let chunks = modulation.split(2, -1)?;
+    /// # Arguments
+    ///
+    /// * `x` – `[B, T, hidden_size]`
+    /// * `c` – `[B, T, cond_size]`
+    ///
+    /// # Returns
+    ///
+    /// `[B, T, output_dim]`
+    fn forward(&self, x: &Tensor, c: &Tensor) -> Result<Tensor> {
+        // AdaLN: SiLU(c) → linear → split into (shift, scale)
+        let modulation = self.ada_ln_linear.forward(&c.apply(&candle_nn::Activation::Silu)?)?;
+        let chunks = modulation.chunk(2, D::Minus1)?;
         let (shift, scale) = (&chunks[0], &chunks[1]);
 
-        // Apply non-affine RMSNorm + modulation + linear
+        // Non-affine RmsNorm + modulation + projection
         let normed = rms_norm_no_affine(x, self.norm_eps)?;
         let modulated = modulate(&normed, shift, scale)?;
         self.linear.forward(&modulated)
     }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.linear.training_mode(mode);
-        self.ada_ln_linear.training_mode(mode);
-    }
 }
 
-// ---- KugelAudioDiffusionHead ----
+// ---------------------------------------------------------------------------
+// DiffusionHead
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, ModuleParameters)]
+/// KugelAudio diffusion prediction head.
+///
+/// Maps `(noisy_speech, condition, timestep)` → predicted noise (or velocity),
+/// operating entirely in `[B, T, D]` space.
+///
+/// Weight key prefix: `model.prediction_head.`
+///
+/// # Example
+///
+/// ```ignore
+/// let vb = vb.pp("model").pp("prediction_head");
+/// let head = DiffusionHead::new(&cfg.diffusion_head_config, vb)?;
+///
+/// // noisy_speech: [B, T, input_dim],  condition: [B, T, hidden_size]
+/// // timesteps:    [B] f32
+/// let predicted = head.forward(&noisy_speech, &condition, &timesteps)?;
+/// ```
+#[derive(Debug, Clone)]
 pub struct DiffusionHead {
-    #[param]
-    pub noisy_images_proj: nn::Linear,
-    #[param]
-    pub cond_proj: nn::Linear,
-    #[param]
-    pub t_embedder: TimestepEmbedder,
-    #[param]
-    pub layers: Vec<HeadLayer>,
-    #[param]
-    pub final_layer: FinalLayer,
-}
-
-/// Input for DiffusionHead: noisy latents, timesteps, conditioning
-pub struct DiffusionHeadInput<'a> {
-    pub noisy_images: &'a Array,
-    pub timesteps: &'a Array,
-    pub condition: &'a Array,
+    /// Linear(input_dim → hidden_size), no bias.
+    noisy_images_proj: Linear,
+    /// Linear(hidden_size → hidden_size), no bias.
+    cond_proj: Linear,
+    t_embedder: TimestepEmbedder,
+    layers: Vec<HeadLayer>,
+    final_layer: FinalLayer,
 }
 
 impl DiffusionHead {
-    pub fn new(config: &DiffusionHeadConfig) -> Result<Self, Exception> {
-        let hidden_size = config.hidden_size;
-        let latent_size = config.latent_size;
-        let ffn_dim = (hidden_size as f32 * config.head_ffn_ratio) as i32;
+    /// Load a [`DiffusionHead`] from `vb`.
+    ///
+    /// `vb` must be scoped to `model.prediction_head.`.
+    pub fn new(cfg: &DiffusionHeadConfig, vb: VarBuilder) -> Result<Self> {
+        let hidden_size = cfg.hidden_size as usize;
+        let input_dim = cfg.speech_vae_dim as usize;
+        let ffn_dim = (cfg.hidden_size as f32 * cfg.head_ffn_ratio) as usize;
+        let num_layers = cfg.head_layers as usize;
+        let norm_eps = cfg.rms_norm_eps as f64;
+        // Sinusoidal frequency embedding size (256 is the standard DiT value).
+        const FREQ_EMBED_SIZE: usize = 256;
 
-        let noisy_images_proj = nn::LinearBuilder::new(latent_size, hidden_size)
-            .bias(false)
-            .build()?;
-        let cond_proj = nn::LinearBuilder::new(hidden_size, hidden_size)
-            .bias(false)
-            .build()?;
-        let t_embedder = TimestepEmbedder::new(hidden_size, 256)?;
+        let noisy_images_proj = linear_no_bias(input_dim, hidden_size, vb.pp("noisy_images_proj"))?;
+        let cond_proj = linear_no_bias(hidden_size, hidden_size, vb.pp("cond_proj"))?;
+        let t_embedder = TimestepEmbedder::new(hidden_size, FREQ_EMBED_SIZE, vb.pp("t_embedder"))?;
 
-        let layers = (0..config.head_layers)
-            .map(|_| HeadLayer::new(hidden_size, ffn_dim, hidden_size, config.rms_norm_eps))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut layers = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            layers.push(HeadLayer::new(hidden_size, ffn_dim, hidden_size, norm_eps, vb.pp("layers").pp(i))?);
+        }
 
-        let final_layer =
-            FinalLayer::new(hidden_size, latent_size, hidden_size, config.rms_norm_eps)?;
+        let final_layer = FinalLayer::new(hidden_size, input_dim, hidden_size, norm_eps, vb.pp("final_layer"))?;
 
         Ok(Self {
             noisy_images_proj,
@@ -336,38 +346,41 @@ impl DiffusionHead {
             final_layer,
         })
     }
-}
 
-impl Module<DiffusionHeadInput<'_>> for DiffusionHead {
-    type Output = Array;
-    type Error = Exception;
+    /// Run the diffusion head forward pass.
+    ///
+    /// # Arguments
+    ///
+    /// * `noisy_speech` – `[B, T, input_dim]` noisy speech latents
+    /// * `condition`    – `[B, T, hidden_size]` LM hidden states
+    /// * `timesteps`    – `[B]` diffusion timesteps (f32)
+    ///
+    /// # Returns
+    ///
+    /// `[B, T, input_dim]` predicted noise (or velocity, depending on scheduler).
+    pub fn forward(
+        &self,
+        noisy_speech: &Tensor,
+        condition: &Tensor,
+        timesteps: &Tensor,
+    ) -> Result<Tensor> {
+        // Project noisy latent into hidden space: [B, T, hidden_size]
+        let mut x = self.noisy_images_proj.forward(noisy_speech)?;
 
-    fn forward(&mut self, input: DiffusionHeadInput<'_>) -> Result<Self::Output, Self::Error> {
-        let DiffusionHeadInput {
-            noisy_images,
-            timesteps,
-            condition,
-        } = input;
+        // Timestep embedding: [B, hidden_size] → broadcast to [B, 1, hidden_size]
+        let t_emb = self.t_embedder.forward(timesteps)?.unsqueeze(1)?;
 
-        let mut x = self.noisy_images_proj.forward(noisy_images)?;
-        let t = self.t_embedder.forward(timesteps)?;
-        let condition = self.cond_proj.forward(condition)?;
-        let c = condition.add(t)?;
+        // Project condition into hidden space: [B, T, hidden_size]
+        let cond = self.cond_proj.forward(condition)?;
 
-        for layer in &mut self.layers {
-            x = layer.forward(HeadLayerInput { x: &x, c: &c })?;
+        // Sum condition and timestep: [B, T, hidden_size]
+        let c = cond.broadcast_add(&t_emb)?;
+
+        // Run through head layers
+        for layer in &self.layers {
+            x = layer.forward(&x, &c)?;
         }
 
-        self.final_layer.forward(HeadLayerInput { x: &x, c: &c })
-    }
-
-    fn training_mode(&mut self, mode: bool) {
-        self.noisy_images_proj.training_mode(mode);
-        self.cond_proj.training_mode(mode);
-        self.t_embedder.training_mode(mode);
-        for layer in &mut self.layers {
-            <HeadLayer as Module<HeadLayerInput>>::training_mode(layer, mode);
-        }
-        <FinalLayer as Module<HeadLayerInput>>::training_mode(&mut self.final_layer, mode);
+        self.final_layer.forward(&x, &c)
     }
 }

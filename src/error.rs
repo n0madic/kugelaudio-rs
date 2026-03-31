@@ -17,8 +17,8 @@ pub enum KugelAudioError {
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
 
-    #[error("MLX error: {0}")]
-    Mlx(#[from] mlx_rs::error::Exception),
+    #[error("Candle error: {0}")]
+    Candle(#[from] candle_core::Error),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

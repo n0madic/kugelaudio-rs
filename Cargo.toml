@@ -1,28 +1,18 @@
 [package]
 name = "kugelaudio-rs"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.82.0"
-description = "KugelAudio TTS inference on Apple Silicon with MLX"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85.0"
+description = "KugelAudio TTS inference — Metal, CUDA, and CPU via candle"
 license = "MIT"
 
-[[bin]]
-name = "kugelaudio-rs"
-path = "src/main.rs"
-
-[[bin]]
-name = "convert-quantized"
-path = "src/bin/convert_quantized.rs"
-
 [dependencies]
-# MLX backend + Qwen2 model (all from OminiX-MLX monorepo, pinned to v1.0.0)
-mlx-rs = { git = "https://github.com/OminiX-ai/OminiX-MLX.git", rev = "48b3fd8", features = ["metal", "accelerate"] }
-mlx-sys = { git = "https://github.com/OminiX-ai/OminiX-MLX.git", rev = "48b3fd8" }
-mlx-rs-core = { git = "https://github.com/OminiX-ai/OminiX-MLX.git", rev = "48b3fd8" }
-qwen3-mlx = { git = "https://github.com/OminiX-ai/OminiX-MLX.git", rev = "48b3fd8" }
+# ML backend (candle by HuggingFace)
+candle-core = "0.9"
+candle-nn = "0.9"
 
 # Tokenization
-tokenizers = "0.21"
+tokenizers = "0.22"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -40,3 +30,9 @@ thiserror = "2"
 
 # Numeric types
 half = "2"
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]

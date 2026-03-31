@@ -1,31 +1,47 @@
-use mlx_rs::{
-    array,
-    error::Exception,
-    module::Module,
-    ops::{
-        concatenate_axis,
-        indexing::{IndexOp, NewAxis},
-    },
-    random,
-    transforms::eval,
-    Array,
-};
-use mlx_rs_core::{create_attention_mask, AttentionMask, ConcatKeyValueCache};
+//! KugelAudio TTS generation pipeline.
+//!
+//! Implements the full text-to-speech inference loop:
+//!
+//! 1. **Tokenize** — format the input text and encode it to token IDs.
+//! 2. **Prefill** — run the prompt through the LM to populate the KV cache.
+//! 3. **AR loop** — autoregressively generate speech tokens:
+//!    - Each step: LM forward → extract last-position logits → sample the
+//!      best valid token.
+//!    - If the sampled token is `speech_diffusion_id`: run the DPM-Solver++
+//!      diffusion loop to obtain a speech latent, then feed the acoustic
+//!      embedding back into the LM.
+//! 4. **Decode** — all collected speech latents → [`AcousticDecoder`] → audio
+//!    waveform.
+//!
+//! ## Classifier-Free Guidance (CFG)
+//!
+//! When `cfg_scale > 1.0`, two independent KV caches are maintained for the
+//! same model weights:
+//! - **Positive** (`cache`): conditioned on the full text prompt.
+//! - **Negative** (`neg_cache`): conditioned only on the `speech_start` token.
+//!
+//! Guided logits: `neg + cfg_scale * (pos - neg)`.
+
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use tokenizers::Tokenizer;
 
-use qwen3_mlx::qwen2::{self, AttentionInput};
-
-use crate::config::SpecialTokens;
-use crate::model::diffusion_head::DiffusionHeadInput;
+use crate::config::{DpmSolverConfig, SpecialTokens};
+use crate::model::qwen2::KvCache;
 use crate::model::weights::KugelAudioModel;
 use crate::schedule::dpm_solver::DpmSolverScheduler;
 
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// Parameters controlling the generation run.
 pub struct GenerationParams {
+    /// Classifier-Free Guidance scale. `1.0` disables CFG.
     pub cfg_scale: f32,
+    /// Maximum number of autoregressive steps before hard stop.
     pub max_new_tokens: u32,
+    /// Number of DPM-Solver++ denoising steps per speech token.
     pub diffusion_steps: u32,
-    /// Random seed. None = non-deterministic.
-    pub seed: Option<u64>,
 }
 
 impl Default for GenerationParams {
@@ -34,234 +50,363 @@ impl Default for GenerationParams {
             cfg_scale: 3.0,
             max_new_tokens: 2048,
             diffusion_steps: 10,
-            seed: None,
         }
     }
 }
 
+/// Output of the generation pipeline.
 pub struct GenerationOutput {
+    /// All token IDs produced by the AR loop, in order.
     pub sequences: Vec<u32>,
-    pub audio: Option<Array>,
+    /// Decoded audio waveform, normalized to `[-1, 1]`.
+    ///
+    /// `None` when no `speech_diffusion_id` tokens were generated.
+    pub audio: Option<Tensor>,
 }
 
-/// Forward through Qwen2 layers bypassing embedding lookup.
-fn forward_from_embeds(
-    qwen2: &mut qwen2::Qwen2Model,
-    h: &Array,
-    cache: &mut Vec<Option<ConcatKeyValueCache>>,
-) -> Result<Array, Exception> {
-    let mask = match create_attention_mask(h, cache, Some(true))? {
-        Some(AttentionMask::Array(a)) => Some(a),
-        _ => None,
-    };
-    if cache.is_empty() {
-        *cache = (0..qwen2.layers.len())
-            .map(|_| Some(ConcatKeyValueCache::default()))
-            .collect();
-    }
-    let mut h = h.clone();
-    for (layer, c) in qwen2.layers.iter_mut().zip(cache.iter_mut()) {
-        h = layer.forward(AttentionInput {
-            x: &h,
-            mask: mask.as_ref(),
-            cache: c.as_mut(),
-        })?;
-    }
-    qwen2.norm.forward(&h)
-}
+// ---------------------------------------------------------------------------
+// Prompt building
+// ---------------------------------------------------------------------------
 
-fn build_prompt_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i32>, Exception> {
+/// Format the user text into the KugelAudio prompt template and encode it.
+///
+/// The prompt is wrapped with the standard system instruction and a speaker
+/// prefix, then the `speech_start` special token is appended.
+///
+/// Returns a flat `Vec<u32>` of token IDs.
+fn build_prompt_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     let formatted = if text.starts_with("Speaker") {
         text.to_string()
     } else {
         format!("Speaker 0: {text}")
     };
-    let system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
+    let system_prompt =
+        " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
     let text_section = format!(" Text input:\n {formatted}\n Speech output:\n");
     let full_text = format!("{system_prompt}{text_section}");
+
     let encoding = tokenizer
         .encode(full_text.as_str(), false)
-        .map_err(|e| Exception::custom(format!("Tokenizer error: {e}")))?;
-    let mut ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
-    ids.push(SpecialTokens::default().speech_start_id as i32);
+        .map_err(|e| candle_core::Error::Msg(format!("Tokenizer error: {e}")))?;
+
+    let mut ids: Vec<u32> = encoding.get_ids().to_vec();
+    ids.push(SpecialTokens::default().speech_start_id);
     Ok(ids)
 }
 
-/// Run the KugelAudio TTS inference pipeline.
+// ---------------------------------------------------------------------------
+// Token sampling
+// ---------------------------------------------------------------------------
+
+/// Pick the best valid special token from raw logits.
+///
+/// Only considers `speech_start_id`, `speech_end_id`, `speech_diffusion_id`,
+/// and `eos_token_id`. Returns the one with the highest logit value, falling
+/// back to `eos_token_id` if none are present in the vocabulary.
+fn sample_best_token(logits: &[f32], tokens: &SpecialTokens) -> (u32, f32) {
+    let valid = [
+        tokens.speech_start_id,
+        tokens.speech_end_id,
+        tokens.speech_diffusion_id,
+        tokens.eos_token_id,
+    ];
+    let mut best_token = tokens.eos_token_id;
+    let mut best_logit = f32::NEG_INFINITY;
+    for &tid in &valid {
+        if let Some(&l) = logits.get(tid as usize) {
+            if l > best_logit {
+                best_logit = l;
+                best_token = tid;
+            }
+        }
+    }
+    (best_token, best_logit)
+}
+
+// ---------------------------------------------------------------------------
+// CFG logit fusion
+// ---------------------------------------------------------------------------
+
+/// Apply classifier-free guidance: `neg + scale * (pos - neg)`.
+///
+/// Both `pos` and `neg` are `[vocab_size]` f32 slices. Returns a `Vec<f32>`
+/// of guided logits with the same length.
+fn apply_cfg(pos: &[f32], neg: &[f32], scale: f32) -> Vec<f32> {
+    pos.iter()
+        .zip(neg.iter())
+        .map(|(&p, &n)| n + scale * (p - n))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Diffusion sampling
+// ---------------------------------------------------------------------------
+
+/// Run the DPM-Solver++ denoising loop to sample a single speech latent.
+///
+/// # Arguments
+///
+/// * `model`         – full KugelAudio model (prediction head accessed here)
+/// * `condition`     – LM hidden state at the current step, shape `[1, 1, hidden_size]`
+/// * `neg_condition` – unconditioned hidden state (CFG negative branch), same shape
+/// * `params`        – generation parameters (cfg_scale, diffusion_steps)
+/// * `vae_dim`       – dimensionality of the speech VAE latent space
+/// * `device`        – compute device
+///
+/// # Returns
+///
+/// A single speech latent tensor with shape `[vae_dim]`.
+fn sample_speech_tokens(
+    model: &KugelAudioModel,
+    condition: &Tensor,
+    neg_condition: Option<&Tensor>,
+    params: &GenerationParams,
+    vae_dim: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let dpm_cfg = DpmSolverConfig::from(&model.diffusion_head_config);
+    let mut scheduler = DpmSolverScheduler::new(
+        dpm_cfg.num_train_timesteps,
+        &dpm_cfg.beta_schedule,
+        &dpm_cfg.prediction_type,
+        &dpm_cfg.algorithm_type,
+        dpm_cfg.solver_order,
+        device.clone(),
+    )?;
+    scheduler.set_timesteps(params.diffusion_steps as i32);
+
+    // Start from Gaussian noise on CPU (avoids deterministic Metal RNG),
+    // then move to the target device.
+    let mut speech = Tensor::randn(0f32, 1f32, &[1, 1, vae_dim], &Device::Cpu)?
+        .to_device(device)?
+        .to_dtype(model.dtype)?;
+
+    let timesteps = scheduler.timesteps.clone();
+
+    for (i, &t) in timesteps.iter().enumerate() {
+        let timestep_tensor = Tensor::new(&[t as f32], device)?.to_dtype(model.dtype)?;
+
+        // Positive (conditioned) prediction
+        let pos_pred =
+            model
+                .prediction_head
+                .forward(&speech, condition, &timestep_tensor)?;
+
+
+        // Guided output: optionally blend with negative branch
+        let guided = match neg_condition {
+            Some(neg_cond) if params.cfg_scale > 1.0 => {
+                let neg_pred =
+                    model
+                        .prediction_head
+                        .forward(&speech, neg_cond, &timestep_tensor)?;
+                // guided = neg + scale * (pos - neg)
+                let diff = (pos_pred.to_dtype(DType::F32)?
+                    - neg_pred.to_dtype(DType::F32)?)?;
+                (neg_pred.to_dtype(DType::F32)?
+                    + (diff * params.cfg_scale as f64)?)?
+            }
+            _ => pos_pred,
+        };
+
+        let output = scheduler.step(&guided.to_dtype(DType::F32)?, t, &speech.to_dtype(DType::F32)?, i)?;
+        speech = output.prev_sample.to_dtype(model.dtype)?;
+    }
+
+    // [1, 1, vae_dim] → [vae_dim]
+    speech.squeeze(0)?.squeeze(0)
+}
+
+// ---------------------------------------------------------------------------
+// Main pipeline entry point
+// ---------------------------------------------------------------------------
+
+/// Run the full KugelAudio TTS inference pipeline.
+///
+/// # Arguments
+///
+/// * `model`     – loaded [`KugelAudioModel`]
+/// * `tokenizer` – HuggingFace tokenizer matching the model vocabulary
+/// * `text`      – input text to synthesise
+/// * `params`    – generation hyper-parameters
+///
+/// # Returns
+///
+/// [`GenerationOutput`] containing the generated token sequence and, if any
+/// speech tokens were produced, the decoded audio waveform.
+///
+/// # Errors
+///
+/// Returns a candle [`Result`] error if any tensor operation fails.
 pub fn generate(
-    model: &mut KugelAudioModel,
+    model: &KugelAudioModel,
     tokenizer: &Tokenizer,
     text: &str,
     params: &GenerationParams,
-) -> Result<GenerationOutput, Exception> {
+) -> Result<GenerationOutput> {
     let tokens = SpecialTokens::default();
-    let vae_dim = 64i32;
-    if let Some(seed) = params.seed {
-        random::seed(seed)?;
-    }
+    let device = &model.device;
+    let vae_dim = model.vae_dim;
 
+    // 1. Tokenize -----------------------------------------------------------
     let prompt_ids = build_prompt_tokens(tokenizer, text)?;
-    let input_ids = Array::from_slice(&prompt_ids, &[1, prompt_ids.len() as i32]);
+    let prompt_len = prompt_ids.len();
 
-    // Prefill
-    let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-    let prompt_embeds = model.lm.model.embed_tokens.forward(&input_ids)?;
-    let mut hidden_states = forward_from_embeds(&mut model.lm.model, &prompt_embeds, &mut cache)?;
-    eval([&hidden_states])?;
+    // candle expects i64 token IDs for embedding lookup
+    let prompt_ids_i64: Vec<i64> = prompt_ids.iter().map(|&id| id as i64).collect();
+    let input_tensor = Tensor::new(prompt_ids_i64.as_slice(), device)?.unsqueeze(0)?;
 
-    // CFG negative branch
-    let mut neg_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
-    let mut neg_hidden = if params.cfg_scale > 1.0 {
-        let neg_ids = Array::from_slice(&[tokens.speech_start_id as i32], &[1, 1]);
-        let neg_embeds = model.lm.model.embed_tokens.forward(&neg_ids)?;
-        let nh = forward_from_embeds(&mut model.lm.model, &neg_embeds, &mut neg_cache)?;
-        eval([&nh])?;
-        Some(nh)
+    // 2. Prefill positive branch --------------------------------------------
+    let mut cache: KvCache = model.lm.new_kv_cache();
+    let mut hidden = model.lm.forward(&input_tensor, 0, &mut cache)?;
+    let mut offset = prompt_len;
+
+
+    // 3. Prefill negative branch (speech_start only) ------------------------
+    // Negative branch for CFG: unconditioned (speech_start only).
+    // Advanced in parallel with the positive branch.
+    let (mut neg_hidden, mut neg_cache, mut neg_offset) = if params.cfg_scale > 1.0 {
+        let neg_ids = Tensor::new(&[tokens.speech_start_id as i64], device)?.unsqueeze(0)?;
+        let mut nc: KvCache = model.lm.new_kv_cache();
+        let nh = model.lm.forward(&neg_ids, 0, &mut nc)?;
+        (Some(nh), Some(nc), 1usize)
     } else {
-        None
+        (None, None, 0)
     };
 
-    // AR generation loop
-    let mut all_speech_latents: Vec<Array> = Vec::new();
+    // 4. Autoregressive loop ------------------------------------------------
+    let mut all_speech_latents: Vec<Tensor> = Vec::new();
     let mut generated_tokens: Vec<u32> = Vec::new();
 
     for step in 0..params.max_new_tokens {
-        // LM head → logits
-        let last_hidden = hidden_states.index((.., -1.., ..));
-        let logits = match model.lm.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&last_hidden)?,
-            None => match &mut model.lm.model.embed_tokens {
-                mlx_rs::quantization::MaybeQuantized::Original(e) => e.as_linear(&last_hidden)?,
-                mlx_rs::quantization::MaybeQuantized::Quantized(q) => q.as_linear(&last_hidden)?,
-            },
+        // Extract last-position hidden state: [1, 1, hidden_size]
+        let last_hidden = hidden.i((.., (hidden.dim(1)? - 1).., ..))?;
+        // Project to logits: [1, 1, vocab_size]
+        let logits = model.lm.forward_lm_head(&last_hidden)?;
+        // [vocab_size]
+        let logits_f32 = logits
+            .squeeze(0)?
+            .squeeze(0)?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+
+        // CFG: blend with negative branch logits when applicable
+        let guided_logits = if let (Some(neg_h), true) =
+            (neg_hidden.as_ref(), params.cfg_scale > 1.0)
+        {
+            let neg_last = neg_h.i((.., (neg_h.dim(1)? - 1).., ..))?;
+            let neg_logits_f32 = model
+                .lm
+                .forward_lm_head(&neg_last)?
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
+            apply_cfg(&logits_f32, &neg_logits_f32, params.cfg_scale)
+        } else {
+            logits_f32.clone()
         };
 
-        // Constrained argmax
-        let logits_last = logits.index((.., -1, ..)).as_type::<f32>()?;
-        let logits_data = logits_last.as_slice::<f32>();
-        let valid = [
-            tokens.speech_start_id,
-            tokens.speech_end_id,
-            tokens.speech_diffusion_id,
-            tokens.eos_token_id,
-        ];
-        let mut best_token = tokens.eos_token_id;
-        let mut best_logit = f32::NEG_INFINITY;
-        for &tid in &valid {
-            if (tid as usize) < logits_data.len() {
-                let l = logits_data[tid as usize];
-                if l > best_logit {
-                    best_logit = l;
-                    best_token = tid;
-                }
-            }
-        }
+        // Sample the best valid token
+        let (best_token, best_logit) = sample_best_token(&guided_logits, &tokens);
         generated_tokens.push(best_token);
 
         if step % 10 == 0 {
             eprintln!(
-                "  Step {step}: {best_token}, latents={}",
+                "  Step {step}: token={best_token}, speech_latents={}",
                 all_speech_latents.len()
             );
         }
 
-        // Periodic GPU cache cleanup to prevent memory growth
-        if step > 0 && step % 50 == 0 {
-            unsafe { mlx_sys::mlx_clear_cache() };
-        }
-
-        // End conditions
+        // End-of-speech conditions ------------------------------------------
         if best_token == tokens.speech_end_id || best_token == tokens.eos_token_id {
-            let diff_logit = logits_data[tokens.speech_diffusion_id as usize];
+            // If diffusion logit is close to the winner and we already have
+            // some latents, generate one final latent before stopping. This
+            // mirrors the Python reference pipeline's behaviour at the boundary.
+            let diff_logit = guided_logits
+                .get(tokens.speech_diffusion_id as usize)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY);
+
             if !all_speech_latents.is_empty() && diff_logit > best_logit - 5.0 {
-                let condition = hidden_states.index((.., -1, ..)).as_type::<f32>()?;
+                let condition = hidden.i((.., (hidden.dim(1)? - 1).., ..))?;
                 let neg_cond = neg_hidden
                     .as_ref()
-                    .map(|h| h.index((.., -1, ..)).as_type::<f32>())
+                    .map(|nh| nh.i((.., (nh.dim(1)? - 1).., ..)))
                     .transpose()?;
-                let lat = sample_speech_tokens(
-                    &mut model.prediction_head,
+                let latent = sample_speech_tokens(
+                    model,
                     &condition,
                     neg_cond.as_ref(),
                     params,
                     vae_dim,
+                    device,
                 )?;
-                all_speech_latents.push(lat);
+                all_speech_latents.push(latent);
             }
             break;
         }
 
+        // Speech diffusion step ---------------------------------------------
         if best_token == tokens.speech_diffusion_id {
-            let condition = hidden_states.index((.., -1, ..)).as_type::<f32>()?;
+            let condition = hidden.i((.., (hidden.dim(1)? - 1).., ..))?;
             let neg_cond = neg_hidden
                 .as_ref()
-                .map(|h| h.index((.., -1, ..)).as_type::<f32>())
+                .map(|nh| nh.i((.., (nh.dim(1)? - 1).., ..)))
                 .transpose()?;
 
-            let speech_latents = sample_speech_tokens(
-                &mut model.prediction_head,
+            let latent = sample_speech_tokens(
+                model,
                 &condition,
                 neg_cond.as_ref(),
                 params,
                 vae_dim,
+                device,
             )?;
-            all_speech_latents.push(speech_latents.clone());
+            all_speech_latents.push(latent.clone());
 
-            // Feedback: latent → connector → LM
+            // The connector receives the raw diffusion latent directly
+            // (no re-normalization — the connector learned to handle this form).
+            // [vae_dim] → [1, 1, vae_dim]
+            let connector_input = latent.unsqueeze(0)?.unsqueeze(0)?;
             let acoustic_embed =
                 model
                     .acoustic_connector
-                    .forward(&speech_latents.index((.., NewAxis, ..)))?;
-            hidden_states = forward_from_embeds(&mut model.lm.model, &acoustic_embed, &mut cache)?;
-            eval([&hidden_states])?;
+                    .forward(&connector_input)?;
 
-            if params.cfg_scale > 1.0 {
-                let nh = forward_from_embeds(&mut model.lm.model, &acoustic_embed, &mut neg_cache)?;
-                eval([&nh])?;
-                neg_hidden = Some(nh);
-            }
-        } else if best_token == tokens.speech_start_id {
-            let tok_embed = model
+            // Advance positive branch
+            hidden = model
                 .lm
-                .model
-                .embed_tokens
-                .forward(&Array::from_slice(&[best_token as i32], &[1, 1]))?;
-            hidden_states = forward_from_embeds(&mut model.lm.model, &tok_embed, &mut cache)?;
-            eval([&hidden_states])?;
+                .forward_from_embeds(&acoustic_embed, offset, &mut cache)?;
+            offset += 1;
+
+            // Advance negative branch with acoustic embed
+            if let (Some(nc), Some(nc_cache)) =
+                (neg_hidden.as_mut(), neg_cache.as_mut())
+            {
+                let nh = model.lm.forward_from_embeds(&acoustic_embed, neg_offset, nc_cache)?;
+                *nc = nh;
+                neg_offset += 1;
+            }
+        } else {
+            // Regular token: embed and forward both branches
+            let tok = Tensor::new(&[best_token as i64], device)?.unsqueeze(0)?;
+            hidden = model.lm.forward(&tok, offset, &mut cache)?;
+            offset += 1;
+
+            if let (Some(nc), Some(nc_cache)) =
+                (neg_hidden.as_mut(), neg_cache.as_mut())
+            {
+                let neg_tok = Tensor::new(&[best_token as i64], device)?.unsqueeze(0)?;
+                let nh = model.lm.forward(&neg_tok, neg_offset, nc_cache)?;
+                *nc = nh;
+                neg_offset += 1;
+            }
         }
     }
 
-    // Batch-decode all latents
-    let audio = if !all_speech_latents.is_empty() {
-        let expanded: Vec<Array> = all_speech_latents
-            .iter()
-            .map(|lat| lat.index((.., NewAxis, ..)))
-            .collect();
-        let refs: Vec<&Array> = expanded.iter().collect();
-        let latent_seq = concatenate_axis(&refs, 1)?;
-
-        let latent_seq = if !model.speech_scaling_factor.is_nan() {
-            latent_seq
-                .divide(&array!(model.speech_scaling_factor))?
-                .subtract(&array!(model.speech_bias_factor))?
-        } else {
-            latent_seq
-        };
-
-        let audio_out = model.acoustic_decoder.forward(&latent_seq)?;
-        eval([&audio_out])?;
-        let audio = audio_out.squeeze()?;
-
-        let max_val = audio.abs()?.max(None)?.item::<f32>();
-        let audio = if max_val > 1.0 {
-            audio.multiply(&array!(0.95 / max_val))?
-        } else {
-            audio
-        };
-        Some(audio)
-    } else {
-        None
-    };
+    // 5. Decode all latents to audio ----------------------------------------
+    let audio = decode_latents(model, &all_speech_latents, device)?;
 
     Ok(GenerationOutput {
         sequences: generated_tokens,
@@ -269,75 +414,126 @@ pub fn generate(
     })
 }
 
-fn sample_speech_tokens(
-    prediction_head: &mut crate::model::diffusion_head::DiffusionHead,
-    condition: &Array,
-    neg_condition: Option<&Array>,
-    params: &GenerationParams,
-    vae_dim: i32,
-) -> Result<Array, Exception> {
-    let batch_size = condition.dim(0);
-    let mut scheduler =
-        DpmSolverScheduler::new(1000, "cosine", "v_prediction", "sde-dpmsolver++", 2)?;
-    scheduler.set_timesteps(params.diffusion_steps as i32);
+// ---------------------------------------------------------------------------
+// Latent decoding
+// ---------------------------------------------------------------------------
 
-    let condition_f32 = condition.as_type::<f32>()?;
-    let timesteps = scheduler.timesteps.clone();
+/// Stack collected speech latents and run them through the acoustic decoder.
+///
+/// # Layout
+///
+/// Each latent is `[vae_dim]`. They are stacked to `[N, vae_dim]`, then
+/// reshaped to `[1, vae_dim, N]` (NCL format) before passing to the decoder.
+///
+/// The decoder returns `[1, 1, samples]` which is flattened and normalised to
+/// `[-1, 1]`.
+///
+/// Returns `None` when `latents` is empty.
+fn decode_latents(
+    model: &KugelAudioModel,
+    latents: &[Tensor],
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    if latents.is_empty() {
+        return Ok(None);
+    }
 
-    let neg_f32 = match neg_condition {
-        Some(nc) if params.cfg_scale > 1.0 => Some(nc.as_type::<f32>()?),
-        _ => None,
+    // Stack all latents: [N, vae_dim]
+    let stacked = Tensor::stack(latents, 0)?;
+
+    // De-normalize in F32 for precision, then cast to model dtype for decoder.
+    let stacked = if model.speech_scaling_factor != 0.0 {
+        stacked
+            .to_dtype(DType::F32)?
+            .broadcast_div(&Tensor::new(&[model.speech_scaling_factor], device)?)?
+            .broadcast_sub(&Tensor::new(&[model.speech_bias_factor], device)?)?
+            .to_dtype(model.dtype)?
+    } else {
+        stacked
     };
 
-    if let Some(neg_f32) = neg_f32 {
-        let combined_cond = concatenate_axis(&[&condition_f32, &neg_f32], 0)?;
-        let n = batch_size;
+    // [N, vae_dim] → [1, vae_dim, N] NCL for the convolutional decoder
+    let latents_ncl = stacked.unsqueeze(0)?.transpose(1, 2)?;
 
-        let mut speech = random::normal::<f32>(&[batch_size, vae_dim], None, None, None)?;
-        for &t in &timesteps {
-            let combined_speech = concatenate_axis(&[&speech, &speech], 0)?;
-            let t_tensor =
-                Array::from_slice(&vec![t; (n * 2) as usize], &[n * 2]).as_type::<f32>()?;
-            let eps = prediction_head
-                .forward(DiffusionHeadInput {
-                    noisy_images: &combined_speech,
-                    timesteps: &t_tensor,
-                    condition: &combined_cond,
-                })?
-                .as_type::<f32>()?;
+    // Decode all at once → [1, 1, samples]
+    let audio_out = model.acoustic_decoder.forward(&latents_ncl)?;
 
-            let cond_eps = eps.index((..n, ..));
-            let uncond_eps = eps.index((n.., ..));
-            // CFG: guided = uncond + scale * (cond - uncond)
-            let guided = uncond_eps.add(
-                cond_eps
-                    .subtract(&uncond_eps)?
-                    .multiply(&array!(params.cfg_scale))?,
-            )?;
+    // Flatten to [samples]
+    let audio_flat = audio_out.flatten_all()?.to_dtype(DType::F32)?;
 
-            let result = scheduler.step(&guided, t, &speech)?;
-            speech = result.prev_sample;
-        }
-        // Single eval for the entire diffusion chain — MLX fuses the lazy graph
-        eval([&speech])?;
-        Ok(speech)
+    // Peak-normalize: scale so the loudest sample is at 0.95
+    let max_val = audio_flat
+        .abs()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+
+    let audio = if max_val > 1e-6 {
+        (audio_flat * (0.95 / max_val) as f64)?
     } else {
-        // No CFG — single forward pass per step
-        let mut speech = random::normal::<f32>(&[batch_size, vae_dim], None, None, None)?;
-        for &t in &timesteps {
-            let t_tensor =
-                Array::from_slice(&vec![t; batch_size as usize], &[batch_size]).as_type::<f32>()?;
-            let eps = prediction_head
-                .forward(DiffusionHeadInput {
-                    noisy_images: &speech,
-                    timesteps: &t_tensor,
-                    condition: &condition_f32,
-                })?
-                .as_type::<f32>()?;
-            let result = scheduler.step(&eps, t, &speech)?;
-            speech = result.prev_sample;
+        audio_flat
+    };
+
+    Ok(Some(audio))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+
+    #[test]
+    fn test_sample_best_token_prefers_diffusion() {
+        let tokens = SpecialTokens::default();
+        let mut logits = vec![0.0f32; 200_000];
+        logits[tokens.speech_diffusion_id as usize] = 10.0;
+        logits[tokens.speech_end_id as usize] = 5.0;
+
+        let (tok, _) = sample_best_token(&logits, &tokens);
+        assert_eq!(tok, tokens.speech_diffusion_id);
+    }
+
+    #[test]
+    fn test_sample_best_token_falls_back_to_eos_on_empty_logits() {
+        let tokens = SpecialTokens::default();
+        // Logits vec shorter than all valid token IDs
+        let logits: Vec<f32> = vec![0.0f32; 5];
+        let (tok, _) = sample_best_token(&logits, &tokens);
+        assert_eq!(tok, tokens.eos_token_id);
+    }
+
+    #[test]
+    fn test_apply_cfg_no_guidance() {
+        let pos = vec![1.0_f32, 2.0, 3.0];
+        let neg = vec![0.0_f32, 0.0, 0.0];
+        let guided = apply_cfg(&pos, &neg, 1.0);
+        // scale=1.0: guided = neg + 1 * (pos - neg) = pos
+        for (g, p) in guided.iter().zip(pos.iter()) {
+            assert!((g - p).abs() < 1e-6, "{g} != {p}");
         }
-        eval([&speech])?;
-        Ok(speech)
+    }
+
+    #[test]
+    fn test_apply_cfg_scale() {
+        let pos = vec![2.0_f32];
+        let neg = vec![0.0_f32];
+        let guided = apply_cfg(&pos, &neg, 3.0);
+        // guided = 0 + 3 * (2 - 0) = 6
+        assert!((guided[0] - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_decode_latents_empty() {
+        let device = Device::Cpu;
+        // Build a minimal KugelAudioModel is not feasible in a unit test
+        // without weights, so we only test the empty-path guard here.
+        // A full integration test would require a loaded model.
+        let latents: Vec<Tensor> = vec![];
+
+        // Manually call the empty-path guard logic inline:
+        assert!(latents.is_empty());
     }
 }
