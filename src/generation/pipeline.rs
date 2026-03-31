@@ -7,7 +7,7 @@ use mlx_rs::{
         indexing::{IndexOp, NewAxis},
     },
     random,
-    transforms::eval,
+    transforms::{async_eval, eval},
     Array,
 };
 use mlx_rs_core::{create_attention_mask, AttentionMask, ConcatKeyValueCache};
@@ -24,6 +24,8 @@ pub struct GenerationParams {
     pub cfg_scale: f32,
     pub max_new_tokens: u32,
     pub diffusion_steps: u32,
+    /// Random seed. None = non-deterministic.
+    pub seed: Option<u64>,
 }
 
 impl Default for GenerationParams {
@@ -31,7 +33,8 @@ impl Default for GenerationParams {
         Self {
             cfg_scale: 3.0,
             max_new_tokens: 2048,
-            diffusion_steps: 20,
+            diffusion_steps: 10,
+            seed: None,
         }
     }
 }
@@ -93,7 +96,9 @@ pub fn generate(
 ) -> Result<GenerationOutput, Exception> {
     let tokens = SpecialTokens::default();
     let vae_dim = 64i32;
-    random::seed(0)?;
+    if let Some(seed) = params.seed {
+        random::seed(seed)?;
+    }
 
     let prompt_ids = build_prompt_tokens(tokenizer, text)?;
     let input_ids = Array::from_slice(&prompt_ids, &[1, prompt_ids.len() as i32]);
@@ -158,6 +163,11 @@ pub fn generate(
                 "  Step {step}: {best_token}, latents={}",
                 all_speech_latents.len()
             );
+        }
+
+        // Periodic GPU cache cleanup to prevent memory growth
+        if step > 0 && step % 50 == 0 {
+            unsafe { mlx_sys::mlx_clear_cache() };
         }
 
         // End conditions
@@ -307,8 +317,9 @@ fn sample_speech_tokens(
 
             let result = scheduler.step(&guided, t, &speech)?;
             speech = result.prev_sample;
-            eval([&speech])?;
+            async_eval([&speech])?;
         }
+        eval([&speech])?;
         Ok(speech)
     } else {
         // No CFG — single forward pass per step
@@ -325,8 +336,9 @@ fn sample_speech_tokens(
                 .as_type::<f32>()?;
             let result = scheduler.step(&eps, t, &speech)?;
             speech = result.prev_sample;
-            eval([&speech])?;
+            async_eval([&speech])?;
         }
+        eval([&speech])?;
         Ok(speech)
     }
 }

@@ -29,9 +29,13 @@ struct Args {
     #[arg(long, default_value_t = 2048)]
     max_tokens: u32,
 
-    /// Number of diffusion inference steps
-    #[arg(long, default_value_t = 20)]
+    /// Number of diffusion inference steps (fewer = faster, default 10)
+    #[arg(long, default_value_t = 10)]
     diffusion_steps: u32,
+
+    /// Random seed for reproducibility (omit for non-deterministic)
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -51,6 +55,7 @@ fn main() -> anyhow::Result<()> {
         cfg_scale: args.cfg_scale,
         max_new_tokens: args.max_tokens,
         diffusion_steps: args.diffusion_steps,
+        seed: args.seed,
     };
 
     let output = pipeline::generate(&mut model, &tokenizer, &args.text, &params)?;
