@@ -5,6 +5,7 @@ use std::rc::Rc;
 use mlx_rs::{
     error::Exception,
     module::{ModuleParameters, ModuleParametersExt},
+    quantization::Quantizable,
     Array,
 };
 use serde::Deserialize;
@@ -34,6 +35,31 @@ pub struct KugelAudioModel {
     pub speech_bias_factor: f32,
     /// Number of diffusion inference steps
     pub ddpm_inference_steps: i32,
+}
+
+impl KugelAudioModel {
+    /// Quantize the LM backbone to 4-bit (group_size=64).
+    /// Reduces memory ~4x and speeds up bandwidth-bound inference.
+    pub fn quantize_lm(&mut self, group_size: i32, bits: i32) -> Result<()> {
+        eprintln!(
+            "Quantizing LM to {bits}-bit (group_size={group_size})..."
+        );
+        // try_into_quantized consumes and returns Self (MaybeQuantized fields switch internally)
+        let args_clone = self.lm.args.clone();
+        let lm = std::mem::replace(
+            &mut self.lm,
+            qwen2::Model::new(args_clone)
+                .map_err(|e| KugelAudioError::Model(format!("{e}")))?,
+        );
+        self.lm = lm
+            .try_into_quantized(group_size, bits)
+            .map_err(|e| KugelAudioError::Model(format!("Quantization failed: {e}")))?;
+        self.lm
+            .eval()
+            .map_err(|e| KugelAudioError::Model(format!("Failed to eval quantized LM: {e}")))?;
+        eprintln!("LM quantized.");
+        Ok(())
+    }
 }
 
 /// Weight map from safetensors index file.

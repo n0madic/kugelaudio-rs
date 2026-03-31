@@ -36,6 +36,10 @@ struct Args {
     /// Random seed for reproducibility (omit for non-deterministic)
     #[arg(long)]
     seed: Option<u64>,
+
+    /// Quantize LM to 4-bit for faster inference (~2-3x speedup, slight quality loss)
+    #[arg(long)]
+    quantize: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,6 +49,9 @@ fn main() -> anyhow::Result<()> {
     eprintln!("Loading model from {}...", args.model_path);
 
     let mut model = weights::load_model(&args.model_path)?;
+    if args.quantize {
+        model.quantize_lm(64, 4)?;
+    }
     eprintln!("Model loaded.");
 
     let tokenizer = qwen3_mlx::qwen2::load_qwen2_tokenizer(&args.model_path)
