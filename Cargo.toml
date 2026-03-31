@@ -1,6 +1,6 @@
 [package]
 name = "kugelaudio-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85.0"
 description = "KugelAudio TTS inference — Metal, CUDA, and CPU via candle"
@@ -30,6 +30,10 @@ thiserror = "2"
 
 # Numeric types
 half = "2"
+
+# Server mode
+tiny_http = "0.12"
+base64    = "0.22"
 
 [features]
 default = []
