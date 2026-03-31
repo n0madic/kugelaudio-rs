@@ -3,15 +3,19 @@ use std::path::Path;
 use std::rc::Rc;
 
 use mlx_rs::{
+    array,
+    builder::Builder,
     error::Exception,
-    module::{ModuleParameters, ModuleParametersExt},
-    quantization::Quantizable,
+    module::{ModuleParameters, ModuleParametersExt, Param},
+    nn,
+    quantization::{MaybeQuantized, Quantizable},
     Array,
 };
 use mlx_sys;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use mlx_rs_core::initialize_rope;
 use qwen3_mlx::qwen2;
 
 use crate::config::KugelAudioConfig;
@@ -42,15 +46,12 @@ impl KugelAudioModel {
     /// Quantize the LM backbone to 4-bit (group_size=64).
     /// Reduces memory ~4x and speeds up bandwidth-bound inference.
     pub fn quantize_lm(&mut self, group_size: i32, bits: i32) -> Result<()> {
-        eprintln!(
-            "Quantizing LM to {bits}-bit (group_size={group_size})..."
-        );
+        eprintln!("Quantizing LM to {bits}-bit (group_size={group_size})...");
         // try_into_quantized consumes and returns Self (MaybeQuantized fields switch internally)
         let args_clone = self.lm.args.clone();
         let lm = std::mem::replace(
             &mut self.lm,
-            qwen2::Model::new(args_clone)
-                .map_err(|e| KugelAudioError::Model(format!("{e}")))?,
+            qwen2::Model::new(args_clone).map_err(|e| KugelAudioError::Model(format!("{e}")))?,
         );
         self.lm = lm
             .try_into_quantized(group_size, bits)
@@ -66,6 +67,347 @@ impl KugelAudioModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pre-quantized model save / load
+// ---------------------------------------------------------------------------
+
+/// Metadata for a pre-quantized model directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantizedMeta {
+    pub group_size: i32,
+    pub bits: i32,
+    pub speech_scaling_factor: f32,
+    pub speech_bias_factor: f32,
+    pub ddpm_inference_steps: i32,
+}
+
+const QUANTIZED_META_FILE: &str = "quantized_config.json";
+
+/// Save a (quantized) model to a directory with per-component safetensors.
+///
+/// Output layout:
+///   lm.safetensors, connector.safetensors, prediction_head.safetensors,
+///   decoder.safetensors, quantized_config.json
+pub fn save_quantized_model(
+    model: &KugelAudioModel,
+    output_dir: impl AsRef<Path>,
+    group_size: i32,
+    bits: i32,
+) -> Result<()> {
+    let output_dir = output_dir.as_ref();
+    std::fs::create_dir_all(output_dir)?;
+
+    eprintln!("Saving LM weights...");
+    save_lm_safetensors(&model.lm, &output_dir.join("lm.safetensors"))?;
+
+    eprintln!("Saving connector weights...");
+    model
+        .acoustic_connector
+        .save_safetensors(output_dir.join("connector.safetensors"))
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Save connector: {e}")))?;
+
+    eprintln!("Saving prediction_head weights...");
+    model
+        .prediction_head
+        .save_safetensors(output_dir.join("prediction_head.safetensors"))
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Save prediction_head: {e}")))?;
+
+    eprintln!("Saving acoustic_decoder weights...");
+    model
+        .acoustic_decoder
+        .save_safetensors(output_dir.join("decoder.safetensors"))
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Save decoder: {e}")))?;
+
+    let meta = QuantizedMeta {
+        group_size,
+        bits,
+        speech_scaling_factor: model.speech_scaling_factor,
+        speech_bias_factor: model.speech_bias_factor,
+        ddpm_inference_steps: model.ddpm_inference_steps,
+    };
+    std::fs::write(
+        output_dir.join(QUANTIZED_META_FILE),
+        serde_json::to_string_pretty(&meta)?,
+    )?;
+
+    Ok(())
+}
+
+/// Load a pre-quantized model from a directory created by `save_quantized_model`.
+///
+/// Peak memory ≈ quantized model size (~4-6 GB for 7B 4-bit) instead of
+/// the full bf16 weight set (~14 GB).
+fn load_quantized_model(model_dir: &Path) -> Result<KugelAudioModel> {
+    let meta: QuantizedMeta = {
+        let path = model_dir.join(QUANTIZED_META_FILE);
+        let file = std::fs::File::open(&path)?;
+        serde_json::from_reader(file)?
+    };
+
+    // We still need the original config for model dimensions.
+    let config: KugelAudioConfig = {
+        let path = model_dir.join("config.json");
+        let file = std::fs::File::open(&path)?;
+        serde_json::from_reader(file)?
+    };
+
+    eprintln!(
+        "Loading pre-quantized model ({}-bit, group_size={})...",
+        meta.bits, meta.group_size
+    );
+
+    // Build quantized LM skeleton with dummy arrays, then load real weights.
+    let mut lm = build_quantized_lm_skeleton(&config, meta.group_size, meta.bits)?;
+    load_lm_safetensors(&mut lm, &model_dir.join("lm.safetensors"))?;
+    eprintln!("  LM loaded.");
+
+    // Non-LM components: build with default weights, then overwrite from safetensors.
+    let mut acoustic_connector =
+        SpeechConnector::new(config.vae_dim(), config.decoder_config.hidden_size, 1e-6).map_err(
+            |e| KugelAudioError::Model(format!("Failed to create SpeechConnector: {e}")),
+        )?;
+    acoustic_connector
+        .load_safetensors(model_dir.join("connector.safetensors"))
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Load connector: {e}")))?;
+    eprintln!("  Connector loaded.");
+
+    let mut prediction_head = DiffusionHead::new(&config.diffusion_head_config)
+        .map_err(|e| KugelAudioError::Model(format!("Failed to create DiffusionHead: {e}")))?;
+    prediction_head
+        .load_safetensors(model_dir.join("prediction_head.safetensors"))
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Load prediction_head: {e}")))?;
+    eprintln!("  Prediction head loaded.");
+
+    let mut acoustic_decoder = AcousticDecoder::new(&config.acoustic_tokenizer_config)
+        .map_err(|e| KugelAudioError::Model(format!("Failed to create AcousticDecoder: {e}")))?;
+    acoustic_decoder
+        .load_safetensors(model_dir.join("decoder.safetensors"))
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Load decoder: {e}")))?;
+    eprintln!("  Decoder loaded.");
+
+    eprintln!("Pre-quantized model loaded.");
+    Ok(KugelAudioModel {
+        lm,
+        acoustic_connector,
+        prediction_head,
+        acoustic_decoder,
+        speech_scaling_factor: meta.speech_scaling_factor,
+        speech_bias_factor: meta.speech_bias_factor,
+        ddpm_inference_steps: meta.ddpm_inference_steps,
+    })
+}
+
+/// Build a qwen2::Model with QuantizedLinear/QuantizedEmbedding layers
+/// and zero-weight placeholders. The caller must `load_safetensors` to
+/// fill in real weights. This avoids materializing 14 GB of random bf16.
+fn build_quantized_lm_skeleton(
+    config: &KugelAudioConfig,
+    group_size: i32,
+    bits: i32,
+) -> Result<qwen2::Model> {
+    let tts_layers = config.tts_layers();
+    let args = qwen2::ModelArgs {
+        model_type: config.decoder_config.model_type.clone(),
+        hidden_size: config.decoder_config.hidden_size,
+        num_hidden_layers: tts_layers,
+        intermediate_size: config.decoder_config.intermediate_size,
+        num_attention_heads: config.decoder_config.num_attention_heads,
+        rms_norm_eps: config.decoder_config.rms_norm_eps,
+        vocab_size: config.decoder_config.vocab_size,
+        num_key_value_heads: config.decoder_config.num_key_value_heads,
+        max_position_embeddings: config.decoder_config.max_position_embeddings,
+        rope_theta: config.decoder_config.rope_theta,
+        rope_traditional: false,
+        rope_scaling: None,
+        tie_word_embeddings: config.decoder_config.tie_word_embeddings,
+        quantization: Some(qwen2::QuantizationConfig { group_size, bits }),
+    };
+
+    let head_dim = args.head_dim();
+
+    let mut layers = Vec::with_capacity(tts_layers as usize);
+    for _ in 0..tts_layers {
+        let rope = initialize_rope(
+            head_dim,
+            args.rope_theta,
+            args.rope_traditional,
+            &args.rope_scaling,
+            args.max_position_embeddings,
+        )
+        .map_err(|e| KugelAudioError::Model(format!("rope init: {e}")))?;
+
+        let attention = qwen2::Attention {
+            n_heads: args.num_attention_heads,
+            n_kv_heads: args.num_key_value_heads,
+            scale: (head_dim as f32).sqrt().recip(),
+            // Qwen2: q/k/v have bias=true, o_proj has bias=false
+            q_proj: MaybeQuantized::Quantized(dummy_quantized_linear(group_size, bits, true)),
+            k_proj: MaybeQuantized::Quantized(dummy_quantized_linear(group_size, bits, true)),
+            v_proj: MaybeQuantized::Quantized(dummy_quantized_linear(group_size, bits, true)),
+            o_proj: MaybeQuantized::Quantized(dummy_quantized_linear(group_size, bits, false)),
+            rope,
+        };
+
+        let mlp = qwen2::Mlp {
+            gate_proj: MaybeQuantized::Quantized(dummy_quantized_linear(group_size, bits, false)),
+            down_proj: MaybeQuantized::Quantized(dummy_quantized_linear(group_size, bits, false)),
+            up_proj: MaybeQuantized::Quantized(dummy_quantized_linear(group_size, bits, false)),
+        };
+
+        let input_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
+            .eps(args.rms_norm_eps)
+            .build()
+            .map_err(|e| KugelAudioError::Model(format!("layernorm: {e}")))?;
+        let post_attention_layernorm = nn::RmsNormBuilder::new(args.hidden_size)
+            .eps(args.rms_norm_eps)
+            .build()
+            .map_err(|e| KugelAudioError::Model(format!("layernorm: {e}")))?;
+
+        layers.push(qwen2::TransformerBlock {
+            num_attention_heads: args.num_attention_heads,
+            hidden_size: args.hidden_size,
+            self_attn: attention,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        });
+    }
+
+    let qwen2_model = qwen2::Qwen2Model {
+        vocab_size: args.vocab_size,
+        num_hidden_layers: tts_layers,
+        embed_tokens: MaybeQuantized::Quantized(dummy_quantized_embedding(group_size, bits)),
+        layers,
+        norm: nn::RmsNormBuilder::new(args.hidden_size)
+            .eps(args.rms_norm_eps)
+            .build()
+            .map_err(|e| KugelAudioError::Model(format!("final norm: {e}")))?,
+    };
+
+    let lm_head = if !args.tie_word_embeddings {
+        Some(MaybeQuantized::Quantized(dummy_quantized_linear(
+            group_size, bits, false,
+        )))
+    } else {
+        None
+    };
+
+    Ok(qwen2::Model {
+        args,
+        model: qwen2_model,
+        lm_head,
+    })
+}
+
+/// QuantizedLinear with zero-scalar placeholders. `load_safetensors` replaces
+/// every Array, so shapes don't matter. `with_bias` must match the original
+/// layer (Qwen2 q/k/v have bias=true, all others bias=false).
+fn dummy_quantized_linear(group_size: i32, bits: i32, with_bias: bool) -> nn::QuantizedLinear {
+    let z = array!(0.0f32);
+    let bias = if with_bias { Some(z.clone()) } else { None };
+    nn::QuantizedLinear {
+        group_size,
+        bits,
+        scales: Param::new(z.clone()),
+        biases: Param::new(z.clone()),
+        inner: nn::Linear {
+            weight: Param::new(z),
+            bias: Param::new(bias),
+        },
+    }
+}
+
+/// QuantizedEmbedding with zero-scalar placeholders.
+fn dummy_quantized_embedding(group_size: i32, bits: i32) -> nn::QuantizedEmbedding {
+    let z = array!(0.0f32);
+    nn::QuantizedEmbedding {
+        group_size,
+        bits,
+        scales: Param::new(z.clone()),
+        biases: Param::new(z.clone()),
+        inner: nn::Embedding {
+            weight: Param::new(z),
+        },
+    }
+}
+
+/// Save quantized LM weights to safetensors.
+///
+/// Workaround: upstream `QuantizedEmbedding` is missing `#[param]` attributes,
+/// so `ModuleParametersExt::save_safetensors` silently skips embed_tokens weights.
+/// We collect them manually and include in the save.
+fn save_lm_safetensors(lm: &qwen2::Model, path: &Path) -> Result<()> {
+    // Collect standard params (all QuantizedLinear layers, norms, etc.)
+    let mut params: HashMap<String, Array> = HashMap::new();
+    for (key, array) in lm.parameters().flatten() {
+        params.insert(key.to_string(), array.clone());
+    }
+
+    // Manually add QuantizedEmbedding fields (missing #[param] upstream)
+    match &lm.model.embed_tokens {
+        MaybeQuantized::Quantized(qe) => {
+            params.insert(
+                "model.embed_tokens.inner.weight".into(),
+                qe.inner.weight.value.clone(),
+            );
+            params.insert("model.embed_tokens.scales".into(), qe.scales.value.clone());
+            params.insert("model.embed_tokens.biases".into(), qe.biases.value.clone());
+        }
+        MaybeQuantized::Original(e) => {
+            params.insert("model.embed_tokens.weight".into(), e.weight.value.clone());
+        }
+    }
+
+    Array::save_safetensors(&params, None, path)
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Save LM: {e}")))?;
+    Ok(())
+}
+
+/// Load quantized LM weights from safetensors into a pre-built skeleton.
+///
+/// Same workaround as `save_lm_safetensors`: QuantizedEmbedding fields must
+/// be set manually since they're invisible to ModuleParameters.
+fn load_lm_safetensors(lm: &mut qwen2::Model, path: &Path) -> Result<()> {
+    let loaded = Array::load_safetensors(path)
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Load LM safetensors: {e}")))?;
+
+    let total_loaded = loaded.len();
+
+    // Phase 1: standard params via ModuleParameters
+    let mut matched = 0usize;
+    {
+        let mut params = lm.parameters_mut().flatten();
+        for (key, value) in &loaded {
+            if let Some(param) = params.get_mut(&**key) {
+                **param = value.clone();
+                matched += 1;
+            }
+        }
+    } // drop flattened map to release mutable borrow
+
+    // Phase 2: manually set QuantizedEmbedding fields (missing #[param] upstream)
+    if let MaybeQuantized::Quantized(ref mut qe) = lm.model.embed_tokens {
+        if let Some(w) = loaded.get("model.embed_tokens.inner.weight") {
+            qe.inner.weight.value = w.clone();
+            matched += 1;
+        }
+        if let Some(s) = loaded.get("model.embed_tokens.scales") {
+            qe.scales.value = s.clone();
+            matched += 1;
+        }
+        if let Some(b) = loaded.get("model.embed_tokens.biases") {
+            qe.biases.value = b.clone();
+            matched += 1;
+        }
+    }
+
+    eprintln!("    LM: {matched}/{total_loaded} weights loaded",);
+
+    lm.eval()
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Eval quantized LM: {e}")))?;
+    Ok(())
+}
+
 /// Weight map from safetensors index file.
 #[derive(Debug, Clone, Deserialize)]
 struct SafetensorsIndex {
@@ -77,6 +419,11 @@ struct SafetensorsIndex {
 /// Load the complete KugelAudio model from a model directory.
 pub fn load_model(model_dir: impl AsRef<Path>) -> Result<KugelAudioModel> {
     let model_dir = model_dir.as_ref();
+
+    // Detect pre-quantized format
+    if model_dir.join(QUANTIZED_META_FILE).exists() {
+        return load_quantized_model(model_dir);
+    }
 
     // Load config
     let config: KugelAudioConfig = {

@@ -37,7 +37,7 @@ struct Args {
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Quantize LM to 4-bit for faster inference (~2-3x speedup, slight quality loss)
+    /// Quantize LM to 4-bit at runtime (use convert-quantized for pre-quantized weights)
     #[arg(long)]
     quantize: bool,
 }
