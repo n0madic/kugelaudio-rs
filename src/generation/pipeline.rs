@@ -7,7 +7,7 @@ use mlx_rs::{
         indexing::{IndexOp, NewAxis},
     },
     random,
-    transforms::{async_eval, eval},
+    transforms::eval,
     Array,
 };
 use mlx_rs_core::{create_attention_mask, AttentionMask, ConcatKeyValueCache};
@@ -317,8 +317,8 @@ fn sample_speech_tokens(
 
             let result = scheduler.step(&guided, t, &speech)?;
             speech = result.prev_sample;
-            async_eval([&speech])?;
         }
+        // Single eval for the entire diffusion chain — MLX fuses the lazy graph
         eval([&speech])?;
         Ok(speech)
     } else {
@@ -336,7 +336,6 @@ fn sample_speech_tokens(
                 .as_type::<f32>()?;
             let result = scheduler.step(&eps, t, &speech)?;
             speech = result.prev_sample;
-            async_eval([&speech])?;
         }
         eval([&speech])?;
         Ok(speech)
