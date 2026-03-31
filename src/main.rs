@@ -37,9 +37,34 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     diffusion_steps: u32,
 
-    /// Compute device: "cpu", "metal", or "cuda"
-    #[arg(long, default_value = "metal")]
-    device: String,
+    /// Compute device: "metal", "cuda", or "cpu" (default: auto-detect best available)
+    #[arg(long)]
+    device: Option<String>,
+}
+
+/// Try GPU backends in order of preference, fall back to CPU.
+fn select_device(requested: Option<&str>) -> anyhow::Result<Device> {
+    match requested {
+        Some("metal") => Device::new_metal(0)
+            .map_err(|e| anyhow::anyhow!("Failed to open Metal device: {e}")),
+        Some("cuda") => Device::new_cuda(0)
+            .map_err(|e| anyhow::anyhow!("Failed to open CUDA device: {e}")),
+        Some("cpu") => Ok(Device::Cpu),
+        Some(other) => anyhow::bail!("Unknown device '{other}'. Use metal, cuda, or cpu."),
+        None => {
+            // Auto-detect: try CUDA first (discrete GPU), then Metal, then CPU.
+            if let Ok(dev) = Device::new_cuda(0) {
+                eprintln!("Using CUDA device.");
+                return Ok(dev);
+            }
+            if let Ok(dev) = Device::new_metal(0) {
+                eprintln!("Using Metal device.");
+                return Ok(dev);
+            }
+            eprintln!("Using CPU device.");
+            Ok(Device::Cpu)
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,16 +72,7 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("KugelAudio-RS v{}", env!("CARGO_PKG_VERSION"));
 
-    // Select compute device.
-    let device =
-        match args.device.as_str() {
-            "cpu" => Device::Cpu,
-            "metal" => Device::new_metal(0)
-                .map_err(|e| anyhow::anyhow!("Failed to open Metal device: {e}"))?,
-            "cuda" => Device::new_cuda(0)
-                .map_err(|e| anyhow::anyhow!("Failed to open CUDA device: {e}"))?,
-            other => anyhow::bail!("Unknown device '{}'. Use cpu, metal, or cuda.", other),
-        };
+    let device = select_device(args.device.as_deref())?;
 
     // Load model weights.
     eprintln!("Loading model from {}...", args.model_path);
