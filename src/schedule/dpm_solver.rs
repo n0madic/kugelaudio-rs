@@ -20,18 +20,6 @@ pub struct SchedulerOutput {
 /// (`alpha_t`, `sigma_t`, `lambda`) so that the per-step arithmetic is
 /// performed in pure Rust (f64), while only the actual sample updates use
 /// candle `Tensor` ops.
-///
-/// # Example
-///
-/// ```ignore
-/// let mut sched = DpmSolverScheduler::new(1000, "cosine", "v_prediction", "sde-dpmsolver++", 2, device)?;
-/// sched.set_timesteps(10);
-/// for (i, &t) in sched.timesteps.clone().iter().enumerate() {
-///     let pred = model.forward(&sample, t)?;
-///     let out = sched.step(&pred, t, &sample, i)?;
-///     sample = out.prev_sample;
-/// }
-/// ```
 pub struct DpmSolverScheduler {
     alpha_t_all: Vec<f64>,
 

@@ -473,7 +473,7 @@ fn decode_latents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Tensor};
+    use candle_core::Tensor;
 
     #[test]
     fn test_sample_best_token_prefers_diffusion() {
@@ -517,13 +517,9 @@ mod tests {
 
     #[test]
     fn test_decode_latents_empty() {
-        let device = Device::Cpu;
-        // Build a minimal KugelAudioModel is not feasible in a unit test
-        // without weights, so we only test the empty-path guard here.
-        // A full integration test would require a loaded model.
+        // Building a KugelAudioModel requires weights, so we only verify
+        // the empty-latents guard that decode_latents checks first.
         let latents: Vec<Tensor> = vec![];
-
-        // Manually call the empty-path guard logic inline:
         assert!(latents.is_empty());
     }
 }

@@ -7,13 +7,6 @@ use candle_nn::{Linear, Module, RmsNorm, VarBuilder, linear_b, rms_norm};
 /// Architecture: Linear(input_dim -> output_dim) -> RMSNorm(output_dim) -> Linear(output_dim -> output_dim)
 ///
 /// Expected VarBuilder prefix: `model.acoustic_connector.`
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let connector = SpeechConnector::new(64, 3584, 1e-5, vb.pp("model.acoustic_connector"))?;
-/// let hidden = connector.forward(&acoustic_features)?;
-/// ```
 pub struct SpeechConnector {
     fc1: Linear,
     norm: RmsNorm,

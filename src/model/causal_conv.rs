@@ -18,13 +18,6 @@ use candle_nn::{
 ///
 /// The inner conv weights are loaded from `vb.pp("conv")` which must
 /// expose the keys `weight` and, when `bias` is true, `bias`.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let conv = SConv1d::new(64, 128, 4, 1, 1, 1, true, true, vb.pp("encoder.conv"))?;
-/// let out = conv.forward(&x)?; // x: [B, 64, L]
-/// ```
 pub struct SConv1d {
     conv: Conv1d,
     causal: bool,
@@ -109,13 +102,6 @@ impl SConv1d {
 ///
 /// The inner convtr weights are loaded from `vb.pp("convtr")` which must
 /// expose the keys `weight` and, when `bias` is true, `bias`.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let convtr = SConvTranspose1d::new(128, 64, 8, 4, true, true, vb.pp("decoder.convtr"))?;
-/// let out = convtr.forward(&x)?; // x: [B, 128, L] -> [B, 64, L*4]
-/// ```
 pub struct SConvTranspose1d {
     convtr: ConvTranspose1d,
     causal: bool,

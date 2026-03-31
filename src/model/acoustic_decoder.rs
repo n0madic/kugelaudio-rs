@@ -187,13 +187,6 @@ impl Block1d {
 ///
 /// The Python checkpoint uses upsample_layers[0] as the stem and
 /// upsample_layers[i+1] as the i-th upsample conv.
-///
-/// # Example
-///
-/// ```ignore
-/// let decoder = AcousticDecoder::load(&config.acoustic_tokenizer_config, vb)?;
-/// let audio = decoder.forward(&latents)?; // [B, 1, samples]
-/// ```
 pub struct AcousticDecoder {
     stem: SConv1d,
     upsample_convs: Vec<SConvTranspose1d>,

@@ -21,22 +21,11 @@
 //! `None` means the cache is empty (prefill from scratch). On each forward
 //! pass the caller supplies the vec and each layer appends to its own slot.
 //!
-//! # Example
+//! # Usage
 //!
-//! ```ignore
-//! use kugelaudio_rs::model::qwen2::{Qwen2Config, Qwen2Model, KvCache};
-//!
-//! let cfg = Qwen2Config::from_decoder_config(&decoder_cfg);
-//! let model = Qwen2Model::new(&cfg, vb)?;
-//! let mut cache: KvCache = vec![None; cfg.num_hidden_layers];
-//!
-//! // Prefill
-//! let hidden = model.forward(&input_ids, 0, &mut cache)?;
-//! // Decode (single step)
-//! let hidden = model.forward(&next_id, seq_len, &mut cache)?;
-//! // Get logits for last token
-//! let logits = model.forward_lm_head(&hidden.i((.., seq_len - 1, ..))?)?;
-//! ```
+//! Build a `Qwen2Config` from `DecoderConfig`, construct with a `VarBuilder`,
+//! then call `forward` for prefill and single-step decode. Use
+//! `forward_from_embeds` to inject acoustic embeddings directly.
 
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{

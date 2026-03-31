@@ -14,14 +14,6 @@
 //! # Weight key prefix
 //!
 //! The parent [`VarBuilder`] must be scoped to `model.prediction_head.`.
-//!
-//! # Example
-//!
-//! ```ignore
-//! let vb = vb.pp("model").pp("prediction_head");
-//! let head = DiffusionHead::new(&cfg.diffusion_head_config, vb)?;
-//! let output = head.forward(&noisy, &condition, &timesteps)?;
-//! ```
 
 use candle_core::{D, DType, Result, Tensor};
 use candle_nn::{Linear, Module, RmsNorm, VarBuilder, linear_no_bias, rms_norm};
@@ -317,17 +309,6 @@ impl FinalLayer {
 /// operating entirely in `[B, T, D]` space.
 ///
 /// Weight key prefix: `model.prediction_head.`
-///
-/// # Example
-///
-/// ```ignore
-/// let vb = vb.pp("model").pp("prediction_head");
-/// let head = DiffusionHead::new(&cfg.diffusion_head_config, vb)?;
-///
-/// // noisy_speech: [B, T, input_dim],  condition: [B, T, hidden_size]
-/// // timesteps:    [B] f32
-/// let predicted = head.forward(&noisy_speech, &condition, &timesteps)?;
-/// ```
 #[derive(Debug, Clone)]
 pub struct DiffusionHead {
     /// Linear(input_dim → hidden_size), no bias.
