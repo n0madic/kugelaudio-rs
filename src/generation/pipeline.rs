@@ -320,11 +320,10 @@ pub fn generate(
         let (best_token, _) = sample_best_token(guided_logits, &tokens);
         generated_tokens.push(best_token);
 
-        if step % 10 == 0 {
-            eprintln!(
-                "  Step {step}: token={best_token}, speech_latents={}",
-                all_speech_latents.len()
-            );
+        if step > 0 && step % 5 == 0 {
+            let n = all_speech_latents.len();
+            let dur = n as f32 * 3200.0 / crate::config::SAMPLE_RATE as f32;
+            eprintln!("  {n} latents, ~{dur:.1}s audio");
         }
 
         // End-of-speech conditions ------------------------------------------
