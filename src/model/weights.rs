@@ -328,10 +328,10 @@ pub fn load_model_gguf(path: &Path, device: &Device) -> Result<KugelAudioModel> 
     })?;
     let gguf_dir = path.parent().unwrap_or(Path::new("."));
 
-    let dtype = match device {
-        Device::Cpu => DType::F32,
-        _ => DType::BF16,
-    };
+    // Quantized models run in F32: QMatMul dequantizes on the fly and returns
+    // F32 tensors. Non-LM components must use the same dtype to avoid matmul
+    // mismatches when the pipeline passes LM hidden states to them.
+    let dtype = DType::F32;
 
     // Parse GGUF header and tensor metadata
     let file = std::fs::File::open(&path).map_err(|e| {
