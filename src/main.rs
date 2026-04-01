@@ -131,16 +131,23 @@ fn main() -> anyhow::Result<()> {
 fn load_model_and_tokenizer(
     args: &Args,
 ) -> anyhow::Result<(KugelAudioModel, tokenizers::Tokenizer)> {
-    let model_path = args.model_path.as_deref().unwrap();
+    let model_path_str = args.model_path.as_deref().unwrap();
     let device = select_device(args.device.as_deref())?;
 
-    eprintln!("Loading model from {model_path}...");
-    let model_dir = Path::new(model_path);
-    let model = weights::load_model(model_dir, &device)
+    eprintln!("Loading model from {model_path_str}...");
+    let model_path = Path::new(model_path_str);
+    let model = weights::load_model(model_path, &device)
         .map_err(|e| anyhow::anyhow!("Model loading failed: {e}"))?;
     eprintln!("Model loaded.");
 
-    let tokenizer_path = model_dir.join("tokenizer.json");
+    // For GGUF files, look for tokenizer.json in the same directory.
+    // For safetensors directories, look inside the directory.
+    let tokenizer_dir = if model_path.is_file() {
+        model_path.parent().unwrap_or(Path::new("."))
+    } else {
+        model_path
+    };
+    let tokenizer_path = tokenizer_dir.join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer loading failed: {e}"))?;
 

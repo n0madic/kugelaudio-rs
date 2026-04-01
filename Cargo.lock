@@ -1038,6 +1038,7 @@ name = "kugelaudio-rs"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "byteorder",
  "candle-core",
  "candle-nn",
  "clap",

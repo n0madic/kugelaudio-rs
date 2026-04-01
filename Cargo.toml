@@ -30,6 +30,8 @@ thiserror = "2"
 
 # Numeric types
 half = "2"
+# Explicit dependency for GGUF binary parsing (also used transitively by candle)
+byteorder = "1"
 
 # Server mode
 tiny_http = "0.12"

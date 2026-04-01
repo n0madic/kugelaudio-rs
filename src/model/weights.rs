@@ -1,7 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::BufReader;
 use std::path::Path;
 
-use candle_core::{DType, Device};
+use candle_core::quantized::gguf_file;
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use serde::Deserialize;
 
@@ -10,6 +12,8 @@ use crate::error::{KugelAudioError, Result};
 use crate::model::acoustic_decoder::AcousticDecoder;
 use crate::model::connector::SpeechConnector;
 use crate::model::diffusion_head::DiffusionHead;
+use crate::model::lm::Lm;
+use crate::model::quantized_qwen2::QuantizedQwen2Model;
 use crate::model::qwen2::{Qwen2Config, Qwen2Model};
 
 // ---------------------------------------------------------------------------
@@ -18,8 +22,8 @@ use crate::model::qwen2::{Qwen2Config, Qwen2Model};
 
 /// Complete KugelAudio model for inference.
 pub struct KugelAudioModel {
-    /// Qwen2 language model backbone (TTS layers only).
-    pub lm: Qwen2Model,
+    /// Qwen2 language model backbone (full-precision or quantized via [`Lm`] enum).
+    pub lm: Lm,
     /// Speech connector: acoustic features → LM hidden space.
     pub acoustic_connector: SpeechConnector,
     /// Diffusion prediction head.
@@ -96,26 +100,88 @@ fn load_config(model_dir: &Path) -> Result<KugelAudioConfig> {
 }
 
 // ---------------------------------------------------------------------------
-// Public entry point
+// GGUF helpers
 // ---------------------------------------------------------------------------
 
-/// Load the complete KugelAudio model from `model_dir`.
+/// Returns `true` if the GGUF tensor name belongs to the Qwen2 LM backbone.
+///
+/// LM tensors follow the llama.cpp naming convention:
+/// - `token_embd.weight` — token embedding
+/// - `output.weight` — LM head (may be tied to embedding)
+/// - `output_norm.weight` — final RMS norm
+/// - `blk.{i}.*` — decoder layer weights (attention, MLP, norms)
+fn is_lm_tensor(name: &str) -> bool {
+    name.starts_with("blk.")
+        || name == "token_embd.weight"
+        || name == "output.weight"
+        || name == "output_norm.weight"
+}
+
+/// Extract a scalar f32 value from a dequantized tensor map.
+///
+/// Handles both 0-d scalar tensors and 1-d single-element tensors by
+/// flattening before extraction.
+fn extract_scalar_tensor(map: &HashMap<String, Tensor>, name: &str) -> Result<f32> {
+    let t = map.get(name).ok_or_else(|| {
+        KugelAudioError::WeightLoading(format!("{name} not found in GGUF tensors"))
+    })?;
+    let values: Vec<f32> = t
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .map_err(|e| KugelAudioError::WeightLoading(format!("{name} read error: {e}")))?;
+    values
+        .into_iter()
+        .next()
+        .ok_or_else(|| KugelAudioError::WeightLoading(format!("{name} tensor is empty")))
+}
+
+/// Load [`KugelAudioConfig`] from GGUF metadata or a fallback `config.json`.
+///
+/// Tries the `kugelaudio.config` GGUF metadata key (JSON string) first.
+/// Falls back to `config.json` in `gguf_dir` if the metadata key is absent.
+fn load_kugelaudio_config_from_gguf(
+    ct: &gguf_file::Content,
+    gguf_dir: &Path,
+) -> Result<KugelAudioConfig> {
+    // Try GGUF metadata first
+    if let Some(gguf_file::Value::String(json_str)) = ct.metadata.get("kugelaudio.config") {
+        return serde_json::from_str(json_str).map_err(|e| {
+            KugelAudioError::Config(format!(
+                "Failed to parse 'kugelaudio.config' GGUF metadata: {e}"
+            ))
+        });
+    }
+
+    // Fallback: config.json alongside the GGUF file
+    let config_path = gguf_dir.join("config.json");
+    let file = std::fs::File::open(&config_path).map_err(|e| {
+        KugelAudioError::Config(format!(
+            "GGUF missing 'kugelaudio.config' metadata and no config.json at {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    serde_json::from_reader(file).map_err(|e| {
+        KugelAudioError::Config(format!("Failed to parse {}: {e}", config_path.display()))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Safetensors loading (directory)
+// ---------------------------------------------------------------------------
+
+/// Load the KugelAudio model from a safetensors model directory.
 ///
 /// The directory must contain:
 /// - `config.json`
 /// - `model.safetensors.index.json`
 /// - `model-0000X-of-00004.safetensors` shard files
 ///
-/// # Errors
-///
-/// Returns an error if any config file is missing or malformed, if any shard
-/// file cannot be memory-mapped, or if a required weight tensor is absent.
-///
 /// # Safety
 ///
 /// Uses `VarBuilder::from_mmaped_safetensors` which memory-maps the shard
 /// files. The files must not be modified while this function is running.
-pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> {
+fn load_model_safetensors(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> {
     // Resolve symlinks and normalize the path before memory-mapping to
     // prevent path-traversal attacks.
     let model_dir = model_dir.canonicalize().map_err(|e| {
@@ -156,8 +222,10 @@ pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> 
     } else {
         Some(vb.clone())
     };
-    let lm = Qwen2Model::new(&qwen2_cfg, vb.pp("model").pp("language_model"), lm_head_vb)
-        .map_err(|e| KugelAudioError::Model(format!("Failed to load language model: {e}")))?;
+    let lm = Lm::Full(
+        Qwen2Model::new(&qwen2_cfg, vb.pp("model").pp("language_model"), lm_head_vb)
+            .map_err(|e| KugelAudioError::Model(format!("Failed to load language model: {e}")))?,
+    );
 
     // Speech connector.
     let acoustic_connector = SpeechConnector::new(
@@ -223,4 +291,254 @@ pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> 
         device: device.clone(),
         dtype,
     })
+}
+
+// ---------------------------------------------------------------------------
+// GGUF loading
+// ---------------------------------------------------------------------------
+
+/// Load the complete KugelAudio model from a GGUF file.
+///
+/// The GGUF file must contain all model tensors:
+/// - **LM backbone** (quantized): standard llama.cpp naming convention
+///   (`token_embd.weight`, `blk.{i}.*`, `output.weight`, `output_norm.weight`)
+/// - **Non-LM components** (dequantized at load time): HuggingFace naming
+///   (`model.acoustic_connector.*`, `model.prediction_head.*`,
+///   `model.acoustic_tokenizer.decoder.*`, `model.speech_scaling_factor`,
+///   `model.speech_bias_factor`)
+///
+/// # GGUF Metadata Keys
+///
+/// ## KugelAudio configuration
+///
+/// | Key                 | Type   | Description                                  |
+/// |---------------------|--------|----------------------------------------------|
+/// | `kugelaudio.config` | String | Full [`KugelAudioConfig`] serialized as JSON  |
+///
+/// If `kugelaudio.config` is absent, falls back to `config.json` in the same
+/// directory as the GGUF file.
+///
+/// # Errors
+///
+/// Returns an error if the GGUF file cannot be parsed, configuration is
+/// missing, or any required tensor is absent.
+pub fn load_model_gguf(path: &Path, device: &Device) -> Result<KugelAudioModel> {
+    let path = path.canonicalize().map_err(|e| {
+        KugelAudioError::WeightLoading(format!("Cannot resolve GGUF path {}: {e}", path.display()))
+    })?;
+    let gguf_dir = path.parent().unwrap_or(Path::new("."));
+
+    let dtype = match device {
+        Device::Cpu => DType::F32,
+        _ => DType::BF16,
+    };
+
+    // Parse GGUF header and tensor metadata
+    let file = std::fs::File::open(&path).map_err(|e| {
+        KugelAudioError::WeightLoading(format!("Cannot open {}: {e}", path.display()))
+    })?;
+    let mut reader = BufReader::new(file);
+    let ct = gguf_file::Content::read(&mut reader)
+        .map_err(|e| KugelAudioError::WeightLoading(format!("Failed to parse GGUF: {e}")))?;
+
+    // Load KugelAudio config from GGUF metadata or fallback config.json
+    let config = load_kugelaudio_config_from_gguf(&ct, gguf_dir)?;
+
+    // Build Qwen2 config for the TTS backbone subset
+    let mut qwen2_cfg = Qwen2Config::from_decoder_config(&config.decoder_config);
+    qwen2_cfg.num_hidden_layers = config.tts_layers() as usize;
+
+    // Load quantized LM backbone from GGUF tensors
+    let quantized_lm = QuantizedQwen2Model::new(&qwen2_cfg, &ct, &mut reader, device)
+        .map_err(|e| KugelAudioError::Model(format!("Failed to load quantized LM: {e}")))?;
+    let lm = Lm::Quantized(quantized_lm);
+
+    // Dequantize non-LM tensors for DiffusionHead, AcousticDecoder, SpeechConnector.
+    // These tensors use HuggingFace naming (e.g. `model.prediction_head.cond_proj.weight`)
+    // and are stored quantized in the GGUF but loaded as full-precision via dequantization.
+    let mut non_lm_tensors: HashMap<String, Tensor> = HashMap::new();
+    for name in ct.tensor_infos.keys() {
+        if !is_lm_tensor(name) {
+            let qt = ct.tensor(&mut reader, name, device).map_err(|e| {
+                KugelAudioError::WeightLoading(format!("Failed to read GGUF tensor '{name}': {e}"))
+            })?;
+            let tensor = qt.dequantize(device).map_err(|e| {
+                KugelAudioError::WeightLoading(format!("Failed to dequantize tensor '{name}': {e}"))
+            })?;
+            non_lm_tensors.insert(name.clone(), tensor);
+        }
+    }
+
+    // Extract scalar factors before handing tensors to VarBuilder
+    let speech_scaling_factor =
+        extract_scalar_tensor(&non_lm_tensors, "model.speech_scaling_factor")?;
+    let speech_bias_factor = extract_scalar_tensor(&non_lm_tensors, "model.speech_bias_factor")?;
+
+    // Build VarBuilder from dequantized non-LM tensors
+    let vb = VarBuilder::from_tensors(non_lm_tensors, dtype, device);
+
+    // Speech connector
+    let acoustic_connector = SpeechConnector::new(
+        config.vae_dim() as usize,
+        config.decoder_config.hidden_size as usize,
+        1e-6,
+        vb.pp("model").pp("acoustic_connector"),
+    )
+    .map_err(|e| KugelAudioError::Model(format!("Failed to load acoustic_connector: {e}")))?;
+
+    // Diffusion prediction head
+    let prediction_head = DiffusionHead::new(
+        &config.diffusion_head_config,
+        vb.pp("model").pp("prediction_head"),
+    )
+    .map_err(|e| KugelAudioError::Model(format!("Failed to load prediction_head: {e}")))?;
+
+    // Acoustic decoder
+    let acoustic_decoder = AcousticDecoder::load(
+        &config.acoustic_tokenizer_config,
+        vb.pp("model").pp("acoustic_tokenizer").pp("decoder"),
+    )
+    .map_err(|e| KugelAudioError::Model(format!("Failed to load acoustic_decoder: {e}")))?;
+
+    let ddpm_inference_steps = config
+        .ddpm_inference_steps
+        .unwrap_or(config.diffusion_head_config.ddpm_num_inference_steps);
+
+    let vae_dim = config.vae_dim() as usize;
+    let diffusion_head_config = config.diffusion_head_config;
+
+    Ok(KugelAudioModel {
+        lm,
+        acoustic_connector,
+        prediction_head,
+        acoustic_decoder,
+        speech_scaling_factor,
+        speech_bias_factor,
+        ddpm_inference_steps,
+        vae_dim,
+        diffusion_head_config,
+        device: device.clone(),
+        dtype,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point (auto-detection)
+// ---------------------------------------------------------------------------
+
+/// Load the complete KugelAudio model, auto-detecting the format.
+///
+/// - If `model_path` is a file ending in `.gguf` → [`load_model_gguf`]
+/// - If `model_path` is a directory → safetensors loading from sharded files
+///
+/// The directory variant requires `config.json`, `model.safetensors.index.json`,
+/// and the corresponding shard files.
+///
+/// # Errors
+///
+/// Returns an error if the path is neither a `.gguf` file nor a safetensors
+/// directory, or if model loading fails.
+pub fn load_model(model_path: &Path, device: &Device) -> Result<KugelAudioModel> {
+    if model_path.is_file()
+        && model_path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
+        load_model_gguf(model_path, device)
+    } else if model_path.is_dir() {
+        load_model_safetensors(model_path, device)
+    } else {
+        Err(KugelAudioError::WeightLoading(format!(
+            "{} is neither a .gguf file nor a model directory",
+            model_path.display()
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_lm_tensor() {
+        // LM backbone tensors (should return true)
+        assert!(is_lm_tensor("token_embd.weight"));
+        assert!(is_lm_tensor("output.weight"));
+        assert!(is_lm_tensor("output_norm.weight"));
+        assert!(is_lm_tensor("blk.0.attn_q.weight"));
+        assert!(is_lm_tensor("blk.27.ffn_down.weight"));
+        assert!(is_lm_tensor("blk.5.attn_norm.weight"));
+
+        // Non-LM tensors (should return false)
+        assert!(!is_lm_tensor("model.acoustic_connector.fc1.weight"));
+        assert!(!is_lm_tensor("model.prediction_head.cond_proj.weight"));
+        assert!(!is_lm_tensor(
+            "model.acoustic_tokenizer.decoder.head.conv.conv.weight"
+        ));
+        assert!(!is_lm_tensor("model.speech_scaling_factor"));
+        assert!(!is_lm_tensor("model.speech_bias_factor"));
+    }
+
+    #[test]
+    fn test_extract_scalar_tensor_0d() {
+        let device = Device::Cpu;
+        let mut map = HashMap::new();
+        let t = Tensor::new(1.5f32, &device).unwrap();
+        map.insert("val".to_string(), t);
+
+        let v = extract_scalar_tensor(&map, "val").unwrap();
+        assert!((v - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_extract_scalar_tensor_1d() {
+        let device = Device::Cpu;
+        let mut map = HashMap::new();
+        let t = Tensor::new(&[2.5f32], &device).unwrap();
+        map.insert("val".to_string(), t);
+
+        let v = extract_scalar_tensor(&map, "val").unwrap();
+        assert!((v - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_extract_scalar_tensor_missing() {
+        let map: HashMap<String, Tensor> = HashMap::new();
+        assert!(extract_scalar_tensor(&map, "missing").is_err());
+    }
+
+    #[test]
+    fn test_load_model_nonexistent_path() {
+        let device = Device::Cpu;
+        let result = load_model(Path::new("/nonexistent/path"), &device);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_gguf_auto_detect() {
+        let device = Device::Cpu;
+
+        // A nonexistent .gguf path is neither is_file() nor is_dir(), so it
+        // falls through to the "neither" error branch.
+        let gguf_result = load_model(Path::new("/nonexistent/model.gguf"), &device);
+        assert!(gguf_result.is_err());
+        let err_msg = format!("{}", gguf_result.err().expect("should fail"));
+        assert!(
+            err_msg.contains("neither a .gguf file nor a model directory"),
+            "Expected detection error, got: {err_msg}"
+        );
+
+        // A nonexistent directory path should also fail with the same error.
+        let dir_result = load_model(Path::new("/nonexistent/model_dir"), &device);
+        assert!(dir_result.is_err());
+        let err_msg = format!("{}", dir_result.err().expect("should fail"));
+        assert!(
+            err_msg.contains("neither a .gguf file nor a model directory"),
+            "Expected detection error, got: {err_msg}"
+        );
+    }
 }
