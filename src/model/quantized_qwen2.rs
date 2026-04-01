@@ -213,10 +213,10 @@ impl QuantizedQwen2Model {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        let dtype = match device {
-            Device::Cpu => DType::F32,
-            _ => DType::BF16,
-        };
+        // Quantized models always run in F32: QMatMul dequantizes on the fly
+        // and returns F32 tensors regardless of device. RoPE tables and causal
+        // masks must match this dtype.
+        let dtype = DType::F32;
 
         // Shared rotary embeddings (computed from config, not from weights)
         let rotary_emb = Arc::new(RotaryEmbedding::new(dtype, cfg, device)?);
