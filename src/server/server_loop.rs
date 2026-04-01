@@ -38,19 +38,19 @@ pub fn run_server_loop(
             diffusion_steps: req.diffusion_steps.unwrap_or(defaults.diffusion_steps),
         };
 
-        // Flush any pending GPU operations before starting generation.
-        // Guards against stale Metal/CUDA state accumulating between requests.
-        if let Device::Metal(_) | Device::Cuda(_) = &model.device {
-            if let Err(e) = model.device.synchronize() {
-                eprintln!("[warn] device synchronize failed: {e}");
-            }
-        }
-
         let response = match pipeline::generate(model, tokenizer, &req.text, &params) {
             Err(e) => GenerateResponse::Error {
                 message: format!("Generation failed: {e}"),
             },
             Ok(output) => {
+                // Ensure all GPU work has completed before reading tensors
+                // back to the host for WAV encoding.
+                if let Device::Metal(_) | Device::Cuda(_) = &model.device {
+                    if let Err(e) = model.device.synchronize() {
+                        eprintln!("[warn] device synchronize failed: {e}");
+                    }
+                }
+
                 let speech_tokens = output
                     .sequences
                     .iter()

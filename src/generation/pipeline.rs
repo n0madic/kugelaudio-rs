@@ -22,6 +22,8 @@
 //!
 //! Guided logits: `neg + cfg_scale * (pos - neg)`.
 
+use std::fmt::Write as _;
+
 use candle_core::{DType, Device, IndexOp, Tensor};
 use tokenizers::Tokenizer;
 
@@ -76,14 +78,15 @@ pub struct GenerationOutput {
 ///
 /// Returns a flat `Vec<u32>` of token IDs.
 fn build_prompt_tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
-    let formatted = if text.starts_with("Speaker") {
-        text.to_string()
+    // Single allocation: estimate total length and build in one buffer
+    let mut full_text = String::with_capacity(128 + text.len());
+    full_text.push_str(" Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n Text input:\n ");
+    if text.starts_with("Speaker") {
+        full_text.push_str(text);
     } else {
-        format!("Speaker 0: {text}")
-    };
-    let system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
-    let text_section = format!(" Text input:\n {formatted}\n Speech output:\n");
-    let full_text = format!("{system_prompt}{text_section}");
+        let _ = write!(full_text, "Speaker 0: {text}");
+    }
+    full_text.push_str("\n Speech output:\n");
 
     let encoding = tokenizer
         .encode(full_text.as_str(), false)
@@ -127,15 +130,18 @@ fn sample_best_token(logits: &[f32], tokens: &SpecialTokens) -> (u32, f32) {
 // CFG logit fusion
 // ---------------------------------------------------------------------------
 
-/// Apply classifier-free guidance: `neg + scale * (pos - neg)`.
+/// Apply classifier-free guidance in-place: `neg + scale * (pos - neg)`.
 ///
-/// Both `pos` and `neg` are `[vocab_size]` f32 slices. Returns a `Vec<f32>`
-/// of guided logits with the same length.
-fn apply_cfg(pos: &[f32], neg: &[f32], scale: f32) -> Vec<f32> {
-    pos.iter()
-        .zip(neg.iter())
-        .map(|(&p, &n)| n + scale * (p - n))
-        .collect()
+/// Both `pos` and `neg` are `[vocab_size]` f32 slices. The result is written
+/// into `out`, which is reused across steps to avoid per-step allocation.
+fn apply_cfg(pos: &[f32], neg: &[f32], scale: f32, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(pos.len().saturating_sub(out.capacity()));
+    out.extend(
+        pos.iter()
+            .zip(neg.iter())
+            .map(|(&p, &n)| n + scale * (p - n)),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -168,20 +174,22 @@ fn sample_speech_tokens(
     scheduler.reset();
 
     // Start from Gaussian noise on CPU (avoids deterministic Metal RNG),
-    // then move to the target device.
-    let mut speech = Tensor::randn(0f32, 1f32, &[1, 1, vae_dim], &Device::Cpu)?
-        .to_device(device)?
-        .to_dtype(model.dtype)?;
+    // then move to the target device. Keep speech in F32 throughout the
+    // diffusion loop — the scheduler operates in F32 anyway — and only
+    // convert to model dtype for the prediction head forward pass.
+    let mut speech =
+        Tensor::randn(0f32, 1f32, &[1, 1, vae_dim], &Device::Cpu)?.to_device(device)?;
 
     let timesteps = scheduler.timesteps.clone();
 
     for (i, &t) in timesteps.iter().enumerate() {
         let timestep_tensor = Tensor::new(&[t as f32], device)?.to_dtype(model.dtype)?;
+        let speech_model = speech.to_dtype(model.dtype)?;
 
         // Positive (conditioned) prediction
         let pos_pred = model
             .prediction_head
-            .forward(&speech, condition, &timestep_tensor)?;
+            .forward(&speech_model, condition, &timestep_tensor)?;
 
         // Guided output: optionally blend with negative branch
         let guided = match neg_condition {
@@ -189,25 +197,21 @@ fn sample_speech_tokens(
                 let neg_pred =
                     model
                         .prediction_head
-                        .forward(&speech, neg_cond, &timestep_tensor)?;
+                        .forward(&speech_model, neg_cond, &timestep_tensor)?;
                 // guided = neg + scale * (pos - neg)
-                let diff = (pos_pred.to_dtype(DType::F32)? - neg_pred.to_dtype(DType::F32)?)?;
-                (neg_pred.to_dtype(DType::F32)? + (diff * params.cfg_scale as f64)?)?
+                let neg_f32 = neg_pred.to_dtype(DType::F32)?;
+                let pos_f32 = pos_pred.to_dtype(DType::F32)?;
+                (&neg_f32 + ((&pos_f32 - &neg_f32)? * params.cfg_scale as f64)?)?
             }
-            _ => pos_pred,
+            _ => pos_pred.to_dtype(DType::F32)?,
         };
 
-        let output = scheduler.step(
-            &guided.to_dtype(DType::F32)?,
-            t,
-            &speech.to_dtype(DType::F32)?,
-            i,
-        )?;
-        speech = output.prev_sample.to_dtype(model.dtype)?;
+        let output = scheduler.step(&guided, t, &speech, i)?;
+        speech = output.prev_sample;
     }
 
-    // [1, 1, vae_dim] → [vae_dim]
-    Ok(speech.squeeze(0)?.squeeze(0)?)
+    // [1, 1, vae_dim] → [vae_dim], back to model dtype for downstream layers
+    Ok(speech.to_dtype(model.dtype)?.squeeze(0)?.squeeze(0)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +285,7 @@ pub fn generate(
     // 5. Autoregressive loop ------------------------------------------------
     let mut all_speech_latents: Vec<Tensor> = Vec::new();
     let mut generated_tokens: Vec<u32> = Vec::new();
+    let mut cfg_buf: Vec<f32> = Vec::new();
 
     for step in 0..params.max_new_tokens {
         // Extract last-position hidden state: [1, 1, hidden_size]
@@ -305,13 +310,14 @@ pub fn generate(
                     .squeeze(0)?
                     .to_dtype(DType::F32)?
                     .to_vec1::<f32>()?;
-                apply_cfg(&logits_f32, &neg_logits_f32, params.cfg_scale)
+                apply_cfg(&logits_f32, &neg_logits_f32, params.cfg_scale, &mut cfg_buf);
+                &cfg_buf
             } else {
-                logits_f32
+                &logits_f32
             };
 
         // Sample the best valid token
-        let (best_token, _) = sample_best_token(&guided_logits, &tokens);
+        let (best_token, _) = sample_best_token(guided_logits, &tokens);
         generated_tokens.push(best_token);
 
         if step % 10 == 0 {
@@ -323,10 +329,10 @@ pub fn generate(
 
         // End-of-speech conditions ------------------------------------------
         if best_token == tokens.speech_end_id || best_token == tokens.eos_token_id {
-            // Always produce one final boundary latent when ending mid-speech.
-            // speech_end can fire slightly before the last phoneme is fully
-            // represented in the latent stream, so the extra diffusion step
-            // captures the trailing audio and prevents syllable clipping.
+            // Generate one final boundary latent from the current (pre-end)
+            // hidden state. speech_end can fire slightly before the last
+            // phoneme is fully represented, so this extra diffusion step
+            // captures any trailing audio.
             if !all_speech_latents.is_empty() {
                 let condition = hidden.i((.., (hidden.dim(1)? - 1).., ..))?;
                 let neg_cond = neg_hidden
@@ -364,12 +370,12 @@ pub fn generate(
                 vae_dim,
                 device,
             )?;
-            all_speech_latents.push(latent.clone());
 
             // The connector receives the raw diffusion latent directly
             // (no re-normalization — the connector learned to handle this form).
             // [vae_dim] → [1, 1, vae_dim]
             let connector_input = latent.unsqueeze(0)?.unsqueeze(0)?;
+            all_speech_latents.push(latent);
             let acoustic_embed = model.acoustic_connector.forward(&connector_input)?;
 
             // Advance positive branch
@@ -460,6 +466,27 @@ fn decode_latents(
     // Flatten to [samples]
     let audio_flat = audio_out.flatten_all()?.to_dtype(DType::F32)?;
 
+    // Apply a short linear fade-out (~30 ms at 24 kHz = 720 samples) to
+    // prevent clicks or noise at the tail caused by the boundary latent.
+    let total_samples = audio_flat.dim(0)?;
+    let fade_len = 720.min(total_samples);
+    let audio_flat = if fade_len > 1 {
+        let fade: Vec<f32> = (0..total_samples)
+            .map(|i| {
+                let tail_pos = total_samples - i;
+                if tail_pos <= fade_len {
+                    tail_pos as f32 / fade_len as f32
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let fade_tensor = Tensor::from_vec(fade, total_samples, device)?;
+        (audio_flat * fade_tensor)?
+    } else {
+        audio_flat
+    };
+
     // Peak-normalize: scale so the loudest sample is at 0.95
     let max_val = audio_flat.abs()?.max(0)?.to_scalar::<f32>()?;
 
@@ -505,9 +532,10 @@ mod tests {
     fn test_apply_cfg_no_guidance() {
         let pos = vec![1.0_f32, 2.0, 3.0];
         let neg = vec![0.0_f32, 0.0, 0.0];
-        let guided = apply_cfg(&pos, &neg, 1.0);
+        let mut buf = Vec::new();
+        apply_cfg(&pos, &neg, 1.0, &mut buf);
         // scale=1.0: guided = neg + 1 * (pos - neg) = pos
-        for (g, p) in guided.iter().zip(pos.iter()) {
+        for (g, p) in buf.iter().zip(pos.iter()) {
             assert!((g - p).abs() < 1e-6, "{g} != {p}");
         }
     }
@@ -516,9 +544,10 @@ mod tests {
     fn test_apply_cfg_scale() {
         let pos = vec![2.0_f32];
         let neg = vec![0.0_f32];
-        let guided = apply_cfg(&pos, &neg, 3.0);
+        let mut buf = Vec::new();
+        apply_cfg(&pos, &neg, 3.0, &mut buf);
         // guided = 0 + 3 * (2 - 0) = 6
-        assert!((guided[0] - 6.0).abs() < 1e-6);
+        assert!((buf[0] - 6.0).abs() < 1e-6);
     }
 
     #[test]
@@ -544,9 +573,10 @@ mod tests {
     fn test_apply_cfg_negative_logits() {
         let pos = vec![-1.0_f32, -2.0];
         let neg = vec![-3.0_f32, -4.0];
-        let guided = apply_cfg(&pos, &neg, 2.0);
+        let mut buf = Vec::new();
+        apply_cfg(&pos, &neg, 2.0, &mut buf);
         // guided = neg + 2 * (pos - neg) = neg + 2*pos - 2*neg = 2*pos - neg
-        assert!((guided[0] - 1.0).abs() < 1e-6); // 2*(-1) - (-3) = 1
-        assert!((guided[1] - 0.0).abs() < 1e-6); // 2*(-2) - (-4) = 0
+        assert!((buf[0] - 1.0).abs() < 1e-6); // 2*(-1) - (-3) = 1
+        assert!((buf[1] - 0.0).abs() < 1e-6); // 2*(-2) - (-4) = 0
     }
 }

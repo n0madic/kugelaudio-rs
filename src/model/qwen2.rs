@@ -274,8 +274,9 @@ impl Attention {
         *kv_cache = Some((k.clone(), v.clone()));
 
         // Repeat KV heads for GQA: [batch, num_heads, full_seq, head_dim]
-        let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+        // repeat_kv's expand→reshape already produces contiguous output.
+        let k = repeat_kv(k, self.num_kv_groups)?;
+        let v = repeat_kv(v, self.num_kv_groups)?;
 
         // Scaled dot-product attention
         let scale = 1.0_f64 / (self.head_dim as f64).sqrt();

@@ -339,28 +339,37 @@ impl DpmSolverScheduler {
         for i in (1..self.solver_order as usize).rev() {
             self.model_outputs[i] = self.model_outputs[i - 1].take();
         }
-        self.model_outputs[0] = Some(x0_pred.clone());
+        self.model_outputs[0] = Some(x0_pred);
 
         let is_final_step = step_idx == self.num_inference_steps as usize - 1;
         let lower_order_final =
             is_final_step && self.num_inference_steps < LOWER_ORDER_FINAL_THRESHOLD;
         let use_first_order = self.lower_order_nums < 1 || lower_order_final;
 
+        // Temporarily take x0_pred and prev_x0 out of the buffer so we can
+        // pass them to &self methods without conflicting borrows.
+        let x0_pred = self.model_outputs[0].take().unwrap();
+        let prev_x0 = self.model_outputs[1].take();
+
         let prev_sample = if self.is_sde {
             if use_first_order {
                 self.sde_first_order(&x0_pred, sample, step_idx)?
-            } else if let Some(prev_x0) = self.model_outputs[1].clone() {
-                self.sde_second_order(&x0_pred, &prev_x0, sample, step_idx)?
+            } else if let Some(ref px0) = prev_x0 {
+                self.sde_second_order(&x0_pred, px0, sample, step_idx)?
             } else {
                 self.sde_first_order(&x0_pred, sample, step_idx)?
             }
         } else if use_first_order {
             self.ode_first_order(&x0_pred, sample, step_idx)?
-        } else if let Some(prev_x0) = self.model_outputs[1].clone() {
-            self.ode_second_order(&x0_pred, &prev_x0, sample, step_idx)?
+        } else if let Some(ref px0) = prev_x0 {
+            self.ode_second_order(&x0_pred, px0, sample, step_idx)?
         } else {
             self.ode_first_order(&x0_pred, sample, step_idx)?
         };
+
+        // Put them back into the buffer.
+        self.model_outputs[1] = prev_x0;
+        self.model_outputs[0] = Some(x0_pred.clone());
 
         if self.lower_order_nums < self.solver_order - 1 {
             self.lower_order_nums += 1;
