@@ -90,32 +90,29 @@ in ~4 s each, eliminating the per-invocation loading cost.
   --http-bind 127.0.0.1:8080
 ```
 
-**Unix socket** — one JSON request line, one JSON response line:
-
-```bash
-# Audio always returned as base64 WAV in the response
-echo '{"text":"Hello world"}' | nc -U /tmp/kugelaudio.sock
-```
-
 **HTTP** (requires `--http-bind`):
 
 ```bash
-# Receive base64 WAV in response
+# Success → raw WAV bytes (Content-Type: audio/wav)
 curl -s -X POST http://127.0.0.1:8080/generate \
   -H 'Content-Type: application/json' \
-  -d '{"text":"Hello world"}' | jq -r .audio_b64 | base64 -d > out.wav
+  -d '{"text":"Hello world"}' -o output.wav
 
 # Health check
 curl http://127.0.0.1:8080/health
 ```
 
-#### Client mode
-
-The same binary connects to a running server when `--model-path` is omitted.
-The server always returns the audio as base64; the client saves it locally.
+**Unix socket** — send one JSON request line, receive raw WAV bytes on success:
 
 ```bash
-# Save WAV to hello.wav
+echo '{"text":"Hello world"}' | nc -U /tmp/kugelaudio.sock > output.wav
+```
+
+#### Client mode
+
+The same binary connects to a running server when `--model-path` is omitted:
+
+```bash
 kugelaudio-rs \
   --socket-path /tmp/kugelaudio.sock \
   --text "Hello world" \
@@ -130,19 +127,25 @@ kugelaudio-rs \
   --output hello.wav
 ```
 
-**External clients (shell / Python)**
+**External clients (Python)**
 
-```bash
-# Shell — nc + jq
-echo '{"text":"Hello world"}' \
-  | nc -U /tmp/kugelaudio.sock \
-  | jq -r .audio_b64 \
-  | base64 -d > out.wav
+```python
+# Python — HTTP
+import requests
+
+def synthesize(text: str) -> bytes:
+    resp = requests.post(
+        "http://127.0.0.1:8080/generate",
+        json={"text": text},
+    )
+    if resp.headers["Content-Type"] == "audio/wav":
+        return resp.content
+    raise RuntimeError(resp.json()["message"])
 ```
 
 ```python
 # Python — Unix socket
-import socket, json, base64
+import socket, json
 
 def synthesize(text: str) -> bytes:
     req = {"text": text}
@@ -150,44 +153,31 @@ def synthesize(text: str) -> bytes:
         s.connect("/tmp/kugelaudio.sock")
         s.sendall((json.dumps(req) + "\n").encode())
         buf = b""
-        while not buf.endswith(b"\n"):
-            buf += s.recv(4096)
+        while chunk := s.recv(65536):
+            buf += chunk
+    if buf[:4] == b"RIFF":
+        return buf  # raw WAV
     resp = json.loads(buf)
-    if resp["status"] != "ok":
-        raise RuntimeError(resp["message"])
-    return base64.b64decode(resp["audio_b64"])
-```
-
-```python
-# Python — HTTP
-import requests, base64
-
-def synthesize(text: str) -> bytes:
-    resp = requests.post(
-        "http://127.0.0.1:8080/generate",
-        json={"text": text},
-    ).json()
-    if resp["status"] != "ok":
-        raise RuntimeError(resp["message"])
-    return base64.b64decode(resp["audio_b64"])
+    raise RuntimeError(resp["message"])
 ```
 
 **Request fields** (both transports):
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `text` | yes | Text to synthesize |
-| `cfg_scale` | no | Overrides server default |
-| `diffusion_steps` | no | Overrides server default |
-| `max_tokens` | no | Overrides server default |
+| `text` | yes | Text to synthesize (max 10,000 chars) |
+| `cfg_scale` | no | Overrides server default (0.0–10.0) |
+| `diffusion_steps` | no | Overrides server default (1–100) |
+| `max_tokens` | no | Overrides server default (1–8192) |
 
-**Response** on success:
+**Response protocol**:
 
-```json
-{"status":"ok","duration_s":4.42,"speech_tokens":32,"audio_b64":"UklGR..."}
-```
+| Transport | Success | Error |
+|-----------|---------|-------|
+| HTTP | Raw WAV bytes, `Content-Type: audio/wav` | JSON, `Content-Type: application/json` |
+| Unix socket | Raw WAV bytes (starts with `RIFF`) | JSON line (starts with `{`) |
 
-**Response** on error:
+Error JSON format:
 
 ```json
 {"status":"error","message":"..."}
@@ -246,8 +236,8 @@ src/
 ├── schedule/
 │   └── dpm_solver.rs          # DPM-Solver++ SDE/ODE scheduler
 └── server/
-    ├── protocol.rs            # Request/response JSON types and WorkItem channel message
-    ├── loop_.rs               # Main-thread processing loop (owns the model)
+    ├── protocol.rs            # Request/response types and WorkItem channel message
+    ├── server_loop.rs         # Main-thread processing loop (owns the model)
     ├── unix.rs                # Unix domain socket acceptor
     └── http.rs                # HTTP server (tiny_http, POST /generate, GET /health)
 ```

@@ -33,7 +33,6 @@ half = "2"
 
 # Server mode
 tiny_http = "0.12"
-base64    = "0.22"
 
 [features]
 default = []

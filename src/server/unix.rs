@@ -6,15 +6,21 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::protocol::{GenerateRequest, GenerateResponse, WorkItem};
+use super::protocol::{ErrorResponse, GenerateRequest, GenerateResponse, WorkItem};
 
 /// Timeout for waiting on a generation response from the server loop.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Spawn a thread that listens on a Unix domain socket.
 ///
-/// Each accepted connection is handled in its own thread:
-/// - Read one JSON line → dispatch to main loop → write one JSON response line.
+/// Each accepted connection is handled in its own thread.
+///
+/// Protocol:
+/// - **Request**: one JSON line (newline-terminated).
+/// - **Response on success**: raw WAV bytes (starts with `RIFF`).
+/// - **Response on error**: one JSON line (starts with `{`).
+///
+/// Clients distinguish success from error by inspecting the first byte.
 ///
 /// A stale socket file from a previous run is removed before binding.
 pub fn spawn_unix_listener(
@@ -83,30 +89,35 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, work_tx: mpsc::Send
         return;
     }
 
-    let response = match serde_json::from_str::<GenerateRequest>(trimmed) {
-        Err(e) => GenerateResponse::Error {
-            message: format!("Invalid request JSON: {e}"),
-        },
-        Ok(request) => {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            if work_tx.send(WorkItem { request, reply_tx }).is_err() {
-                GenerateResponse::Error {
-                    message: "Server shutting down".to_string(),
-                }
-            } else {
-                reply_rx
-                    .recv_timeout(REPLY_TIMEOUT)
-                    .unwrap_or(GenerateResponse::Error {
-                        message: "Generation timed out".to_string(),
-                    })
-            }
+    let request = match serde_json::from_str::<GenerateRequest>(trimmed) {
+        Err(e) => {
+            let err = ErrorResponse::new(format!("Invalid request JSON: {e}"));
+            let _ = write_half.write_all(err.to_json().as_bytes());
+            let _ = write_half.write_all(b"\n");
+            return;
         }
+        Ok(r) => r,
     };
 
-    match serde_json::to_string(&response) {
-        Err(e) => eprintln!("[unix] Serialize error: {e}"),
-        Ok(json) => {
-            let _ = write_half.write_all(json.as_bytes());
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if work_tx.send(WorkItem { request, reply_tx }).is_err() {
+        let err = ErrorResponse::new("Server shutting down".to_string());
+        let _ = write_half.write_all(err.to_json().as_bytes());
+        let _ = write_half.write_all(b"\n");
+        return;
+    }
+
+    let gen_response = reply_rx
+        .recv_timeout(REPLY_TIMEOUT)
+        .unwrap_or(GenerateResponse::Error("Generation timed out".to_string()));
+
+    match gen_response {
+        GenerateResponse::Ok(wav_bytes) => {
+            let _ = write_half.write_all(&wav_bytes);
+        }
+        GenerateResponse::Error(msg) => {
+            let err = ErrorResponse::new(msg);
+            let _ = write_half.write_all(err.to_json().as_bytes());
             let _ = write_half.write_all(b"\n");
         }
     }

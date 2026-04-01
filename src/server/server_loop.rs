@@ -1,11 +1,10 @@
 use std::sync::mpsc;
 
-use base64::Engine as _;
 use candle_core::Device;
 use tokenizers::Tokenizer;
 
 use crate::audio::wav;
-use crate::config::{SAMPLE_RATE, SpecialTokens};
+use crate::config::SpecialTokens;
 use crate::generation::pipeline::{self, GenerationParams, MAX_TEXT_CHARS};
 use crate::model::weights::KugelAudioModel;
 
@@ -27,19 +26,17 @@ pub fn run_server_loop(
     defaults: &ServerDefaults,
     work_rx: mpsc::Receiver<WorkItem>,
 ) {
-    let tokens = SpecialTokens::default();
+    let _tokens = SpecialTokens::default();
 
     for item in work_rx {
         let req = &item.request;
 
         // Reject oversized text early, before tokenization.
         if req.text.len() > MAX_TEXT_CHARS {
-            let _ = item.reply_tx.send(GenerateResponse::Error {
-                message: format!(
-                    "Text too long ({} chars, max {MAX_TEXT_CHARS})",
-                    req.text.len()
-                ),
-            });
+            let _ = item.reply_tx.send(GenerateResponse::Error(format!(
+                "Text too long ({} chars, max {MAX_TEXT_CHARS})",
+                req.text.len()
+            )));
             continue;
         }
 
@@ -51,9 +48,7 @@ pub fn run_server_loop(
         .validated();
 
         let response = match pipeline::generate(model, tokenizer, &req.text, &params) {
-            Err(e) => GenerateResponse::Error {
-                message: format!("Generation failed: {e}"),
-            },
+            Err(e) => GenerateResponse::Error(format!("Generation failed: {e}")),
             Ok(output) => {
                 // Ensure all GPU work has completed before reading tensors
                 // back to the host for WAV encoding.
@@ -63,30 +58,11 @@ pub fn run_server_loop(
                     }
                 }
 
-                let speech_tokens = output
-                    .sequences
-                    .iter()
-                    .filter(|&&t| t == tokens.speech_diffusion_id)
-                    .count();
-                let duration_s = speech_tokens as f32 * 3200.0 / SAMPLE_RATE as f32;
-
                 match output.audio {
-                    None => GenerateResponse::Error {
-                        message: "No speech tokens generated".to_string(),
-                    },
+                    None => GenerateResponse::Error("No speech tokens generated".to_string()),
                     Some(ref audio) => match wav::to_wav_bytes(audio) {
-                        Err(e) => GenerateResponse::Error {
-                            message: format!("WAV encoding failed: {e}"),
-                        },
-                        Ok(bytes) => {
-                            let audio_b64 =
-                                base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            GenerateResponse::Ok {
-                                duration_s,
-                                speech_tokens,
-                                audio_b64,
-                            }
-                        }
+                        Err(e) => GenerateResponse::Error(format!("WAV encoding failed: {e}")),
+                        Ok(bytes) => GenerateResponse::Ok(bytes),
                     },
                 }
             }

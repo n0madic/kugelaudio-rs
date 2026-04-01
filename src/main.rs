@@ -1,9 +1,8 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read as _, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc;
 
-use base64::Engine as _;
 use candle_core::Device;
 use clap::Parser;
 
@@ -12,7 +11,7 @@ use kugelaudio_rs::config::{SAMPLE_RATE, SpecialTokens};
 use kugelaudio_rs::generation::pipeline::{self, GenerationParams};
 use kugelaudio_rs::model::weights::{self, KugelAudioModel};
 use kugelaudio_rs::server::http::spawn_http_listener;
-use kugelaudio_rs::server::protocol::{GenerateRequest, GenerateResponse, WorkItem};
+use kugelaudio_rs::server::protocol::{ErrorResponse, GenerateRequest, WorkItem};
 use kugelaudio_rs::server::server_loop::{ServerDefaults, run_server_loop};
 use kugelaudio_rs::server::unix::spawn_unix_listener;
 
@@ -264,35 +263,32 @@ fn run_client_mode(args: &Args) -> anyhow::Result<()> {
 
     let json_req = serde_json::to_string(&req)?;
 
-    let stream = UnixStream::connect(&args.socket_path)
+    let mut stream = UnixStream::connect(&args.socket_path)
         .map_err(|e| anyhow::anyhow!("Cannot connect to {}: {e}", args.socket_path))?;
     let mut write_half = stream.try_clone()?;
 
     write_half.write_all(json_req.as_bytes())?;
     write_half.write_all(b"\n")?;
 
-    let mut response_line = String::new();
-    BufReader::new(stream).read_line(&mut response_line)?;
+    // Read entire response. The first 4 bytes distinguish WAV (starts with
+    // "RIFF") from a JSON error (starts with "{").
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
 
-    let resp: GenerateResponse = serde_json::from_str(response_line.trim())
-        .map_err(|e| anyhow::anyhow!("Invalid response from server: {e}"))?;
-
-    match resp {
-        GenerateResponse::Error { message } => {
-            anyhow::bail!("Server error: {message}");
-        }
-        GenerateResponse::Ok {
-            duration_s,
-            speech_tokens,
-            audio_b64,
-        } => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(&audio_b64)
-                .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
-            std::fs::write(output, &bytes)
-                .map_err(|e| anyhow::anyhow!("Failed to write {output}: {e}"))?;
-            eprintln!("Saved {output} ({duration_s:.1}s, {speech_tokens} speech tokens)");
-        }
+    if response.starts_with(b"RIFF") {
+        std::fs::write(output, &response)
+            .map_err(|e| anyhow::anyhow!("Failed to write {output}: {e}"))?;
+        // WAV header: bytes 4..8 are file size, data starts at 44.
+        // Sample count = (file_size - 44) / 2  (16-bit mono)
+        let n_samples = response.len().saturating_sub(44) / 2;
+        let duration_s = n_samples as f32 / SAMPLE_RATE as f32;
+        eprintln!("Saved {output} ({duration_s:.1}s)");
+    } else {
+        // JSON error response
+        let text = String::from_utf8_lossy(&response);
+        let err: ErrorResponse = serde_json::from_str(text.trim())
+            .map_err(|e| anyhow::anyhow!("Invalid response from server: {e}"))?;
+        anyhow::bail!("Server error: {}", err.message);
     }
 
     Ok(())

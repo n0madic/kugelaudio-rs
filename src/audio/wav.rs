@@ -40,8 +40,7 @@ pub fn write_wav(path: impl AsRef<Path>, audio: &Tensor) -> Result<()> {
 
 /// Encode audio samples as a WAV file in memory (24kHz, 16-bit PCM, mono).
 ///
-/// Returns the raw WAV bytes (including header), suitable for embedding in
-/// a JSON response as a base64 string.
+/// Returns the complete WAV file as raw bytes (including header).
 pub fn to_wav_bytes(audio: &Tensor) -> crate::error::Result<Vec<u8>> {
     let spec = WavSpec {
         channels: 1,

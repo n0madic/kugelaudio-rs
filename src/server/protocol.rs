@@ -14,19 +14,37 @@ pub struct GenerateRequest {
     pub max_tokens: Option<u32>,
 }
 
-/// Outbound JSON response.
+/// JSON error response sent when generation fails.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "lowercase")]
+pub struct ErrorResponse {
+    pub status: String,
+    pub message: String,
+}
+
+impl ErrorResponse {
+    pub fn new(message: String) -> Self {
+        Self {
+            status: "error".to_string(),
+            message,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            r#"{"status":"error","message":"serialization failed"}"#.to_string()
+        })
+    }
+}
+
+/// Server-internal response passed from the generation loop to transport threads.
+///
+/// Success carries raw WAV bytes — no base64 overhead.
+/// Error carries a message that each transport serializes as JSON.
 pub enum GenerateResponse {
-    Ok {
-        duration_s: f32,
-        speech_tokens: usize,
-        /// WAV audio encoded as base64.
-        audio_b64: String,
-    },
-    Error {
-        message: String,
-    },
+    /// Raw WAV audio bytes.
+    Ok(Vec<u8>),
+    /// Human-readable error message.
+    Error(String),
 }
 
 /// A single unit of work sent from an acceptor thread to the main loop.
