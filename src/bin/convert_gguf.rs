@@ -311,10 +311,18 @@ fn main() -> anyhow::Result<()> {
 
         let tensor = all_tensors.get(hf_name).expect("key exists");
 
-        // QTensor::quantize requires CPU F32 tensors
+        // QTensor::quantize requires CPU F32 tensors with non-empty shape.
+        // Scalar (0-d) tensors must be reshaped to [1] first.
         let tensor_f32 = tensor
             .to_dtype(DType::F32)
             .with_context(|| format!("Failed to convert '{hf_name}' to F32"))?;
+        let tensor_f32 = if tensor_f32.dims().is_empty() {
+            tensor_f32
+                .reshape(1)
+                .with_context(|| format!("Failed to reshape scalar '{hf_name}' to [1]"))?
+        } else {
+            tensor_f32
+        };
 
         let qtensor = QTensor::quantize(&tensor_f32, storage_dtype)
             .with_context(|| format!("Failed to quantize '{hf_name}' as {storage_dtype:?}"))?;
