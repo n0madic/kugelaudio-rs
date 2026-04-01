@@ -32,7 +32,24 @@ Text ─→ Tokenizer ─→ Qwen2 LM ─→ AR token loop ───┐
 huggingface-cli download kugelaudio/kugelaudio-0-open --local-dir /tmp/kugelaudio_model
 ```
 
-### 2. Build
+### 2. Build (optional: convert to quantized GGUF)
+
+Quantized GGUF models use 2-4x less memory and load faster:
+
+```bash
+# Build the conversion tool
+cargo build --release --bin convert_gguf
+
+# Convert to GGUF (Q8_0 quantization — best quality/size tradeoff)
+./target/release/convert_gguf \
+  --model-dir /tmp/kugelaudio_model \
+  --output /tmp/kugelaudio_model/kugelaudio-q8_0.gguf \
+  --quant-type q8_0
+
+# Other quantization options: q4k (smallest), q5k, q8_0 (default), f16 (no quantization)
+```
+
+### 3. Build
 
 ```bash
 # macOS (Apple Silicon)
@@ -45,13 +62,20 @@ cargo build --release --features cuda
 cargo build --release
 ```
 
-### 3. Run
+### 4. Run
 
 #### CLI mode
 
 ```bash
+# From safetensors directory (full precision, ~14 GB)
 ./target/release/kugelaudio-rs \
   --model-path /tmp/kugelaudio_model \
+  --text "Hello world" \
+  --output hello.wav
+
+# From GGUF file (quantized, ~4-8 GB depending on quant type)
+./target/release/kugelaudio-rs \
+  --model-path /tmp/kugelaudio_model/kugelaudio-q8_0.gguf \
   --text "Hello world" \
   --output hello.wav
 ```
@@ -187,7 +211,7 @@ Error JSON format:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model-path` | — | Path to model directory. Required for CLI/server mode. **Omit to run as a client.** |
+| `--model-path` | — | Path to model directory (safetensors) or `.gguf` file. Required for CLI/server mode. **Omit to run as a client.** |
 | `--text` | — | Text to synthesize. Required in CLI and client modes. |
 | `--output` | `output.wav` | Output WAV file path |
 | `--cfg-scale` | `3.0` | Classifier-free guidance scale (1.0 = disabled) |
@@ -202,8 +226,8 @@ Error JSON format:
 ## Requirements
 
 - **Rust** 1.85+
-- **Model weights**: [kugelaudio/kugelaudio-0-open](https://huggingface.co/kugelaudio/kugelaudio-0-open) (~14 GB, bfloat16 safetensors)
-- **Memory**: ~14 GB GPU/unified memory for bfloat16 inference; ~28 GB for CPU (float32)
+- **Model weights**: [kugelaudio/kugelaudio-0-open](https://huggingface.co/kugelaudio/kugelaudio-0-open) (~14 GB, bfloat16 safetensors) — or convert to GGUF for smaller size
+- **Memory**: ~14 GB GPU/unified memory for bfloat16 inference; ~28 GB for CPU (float32); ~4-8 GB for quantized GGUF
 
 ### Platform-specific
 
@@ -222,15 +246,19 @@ src/
 ├── lib.rs                     # Library root
 ├── config.rs                  # Model configuration (serde)
 ├── error.rs                   # Error types
+├── bin/
+│   └── convert_gguf.rs        # Safetensors → GGUF conversion tool
 ├── audio/
 │   └── wav.rs                 # WAV file writer and in-memory encoder (24 kHz PCM)
 ├── model/
 │   ├── qwen2.rs               # Qwen2 transformer (external KV cache for CFG)
+│   ├── quantized_qwen2.rs     # Quantized Qwen2 (QMatMul, GGUF weights)
+│   ├── lm.rs                  # Unified Lm enum (Full | Quantized)
 │   ├── connector.rs           # Speech connector (Linear → RMSNorm → Linear)
 │   ├── diffusion_head.rs      # Diffusion prediction head (AdaLN + SwiGLU)
 │   ├── acoustic_decoder.rs    # Convolutional audio decoder (7 upsample stages)
 │   ├── causal_conv.rs         # Causal Conv1d / ConvTranspose1d wrappers
-│   └── weights.rs             # Weight loading via VarBuilder
+│   └── weights.rs             # Weight loading (safetensors + GGUF auto-detect)
 ├── generation/
 │   └── pipeline.rs            # End-to-end TTS generation pipeline
 ├── schedule/
@@ -248,6 +276,7 @@ src/
 - **NCL tensor format throughout** — Matches PyTorch/candle convention. No NLC transpositions needed; checkpoint weights load directly.
 - **VarBuilder weight loading** — No key remapping. Rust struct hierarchy mirrors the checkpoint key structure, and `VarBuilder::pp()` handles namespacing.
 - **BF16 inference** on GPU, **F32** on CPU — Auto-selected based on device capabilities.
+- **GGUF quantization** — LM backbone quantized to Q4K/Q5K/Q8_0 via `convert_gguf` binary. Non-LM components (diffusion head, acoustic decoder, connector) stored as F16 for quality. Unified `Lm` enum dispatches both full-precision and quantized models transparently.
 
 ## License
 
