@@ -341,6 +341,21 @@ pub fn load_model_gguf(path: &Path, device: &Device) -> Result<KugelAudioModel> 
     let ct = gguf_file::Content::read(&mut reader)
         .map_err(|e| KugelAudioError::WeightLoading(format!("Failed to parse GGUF: {e}")))?;
 
+    // Log quantization info from GGUF metadata
+    if let Some(gguf_file::Value::String(name)) = ct.metadata.get("general.name") {
+        eprint!("GGUF model: {name}");
+    }
+    // Detect quantization type from the first LM weight matrix
+    let quant_type = ct
+        .tensor_infos
+        .get("blk.0.attn_q.weight")
+        .map(|info| format!("{:?}", info.ggml_dtype));
+    if let Some(qt) = &quant_type {
+        eprintln!(" (quantization: {qt})");
+    } else {
+        eprintln!();
+    }
+
     // Load KugelAudio config from GGUF metadata or fallback config.json
     let config = load_kugelaudio_config_from_gguf(&ct, gguf_dir)?;
 
