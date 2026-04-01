@@ -1,9 +1,10 @@
-use std::io::{Read as _, Write};
+use std::io::{BufReader, Read as _, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc;
 
 use candle_core::Device;
+use candle_core::quantized::gguf_file;
 use clap::Parser;
 
 use kugelaudio_rs::audio::wav;
@@ -128,6 +129,35 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Extract tokenizer from GGUF metadata (`tokenizer.huggingface.json` key),
+/// falling back to `tokenizer.json` in the same directory as the GGUF file.
+fn load_tokenizer_from_gguf(gguf_path: &Path) -> anyhow::Result<tokenizers::Tokenizer> {
+    let file = std::fs::File::open(gguf_path)
+        .map_err(|e| anyhow::anyhow!("Cannot open GGUF for tokenizer: {e}"))?;
+    let mut reader = BufReader::new(file);
+    let content = gguf_file::Content::read(&mut reader)
+        .map_err(|e| anyhow::anyhow!("Failed to read GGUF header: {e}"))?;
+
+    // Try embedded tokenizer first.
+    if let Some(gguf_file::Value::String(json)) =
+        content.metadata.get("tokenizer.huggingface.json")
+    {
+        eprintln!("Using embedded tokenizer from GGUF metadata.");
+        return tokenizers::Tokenizer::from_bytes(json.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Failed to parse embedded tokenizer: {e}"));
+    }
+
+    // Fall back to tokenizer.json next to the GGUF file.
+    let dir = gguf_path.parent().unwrap_or(Path::new("."));
+    let fallback = dir.join("tokenizer.json");
+    eprintln!(
+        "No embedded tokenizer in GGUF, falling back to {}",
+        fallback.display()
+    );
+    tokenizers::Tokenizer::from_file(&fallback)
+        .map_err(|e| anyhow::anyhow!("Tokenizer loading failed: {e}"))
+}
+
 fn load_model_and_tokenizer(
     args: &Args,
 ) -> anyhow::Result<(KugelAudioModel, tokenizers::Tokenizer)> {
@@ -140,16 +170,18 @@ fn load_model_and_tokenizer(
         .map_err(|e| anyhow::anyhow!("Model loading failed: {e}"))?;
     eprintln!("Model loaded.");
 
-    // For GGUF files, look for tokenizer.json in the same directory.
-    // For safetensors directories, look inside the directory.
-    let tokenizer_dir = if model_path.is_file() {
-        model_path.parent().unwrap_or(Path::new("."))
+    // Load tokenizer: for GGUF, try embedded metadata first, then file fallback.
+    let tokenizer = if model_path.is_file()
+        && model_path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
+        load_tokenizer_from_gguf(model_path)?
     } else {
-        model_path
+        let tokenizer_path = model_path.join("tokenizer.json");
+        tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Tokenizer loading failed: {e}"))?
     };
-    let tokenizer_path = tokenizer_dir.join("tokenizer.json");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("Tokenizer loading failed: {e}"))?;
 
     Ok((model, tokenizer))
 }

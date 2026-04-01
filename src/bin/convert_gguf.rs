@@ -337,7 +337,19 @@ fn main() -> anyhow::Result<()> {
         gguf_tensors.len()
     );
 
-    // ── 4. Build GGUF metadata ───────────────────────────────────────────
+    // ── 4. Embed tokenizer ────────────────────────────────────────────────
+    let tokenizer_path = args.model_dir.join("tokenizer.json");
+    let tokenizer_val = if tokenizer_path.exists() {
+        let raw = fs::read_to_string(&tokenizer_path)
+            .with_context(|| format!("Failed to read {}", tokenizer_path.display()))?;
+        eprintln!("Embedding tokenizer ({} bytes).", raw.len());
+        Some(Value::String(raw))
+    } else {
+        eprintln!("Warning: tokenizer.json not found, GGUF will not contain tokenizer.");
+        None
+    };
+
+    // ── 5. Build GGUF metadata ───────────────────────────────────────────
     let arch_val = Value::String("kugelaudio".to_string());
     let name_val = Value::String("KugelAudio-7B-TTS".to_string());
     let file_type_val = Value::U32(file_type_id(quant_dtype));
@@ -350,7 +362,7 @@ fn main() -> anyhow::Result<()> {
     let head_count_kv_val = Value::U32(config.decoder_config.num_key_value_heads as u32);
     let vae_dim_val = Value::U32(config.vae_dim() as u32);
 
-    let metadata: Vec<(&str, &Value)> = vec![
+    let mut metadata: Vec<(&str, &Value)> = vec![
         ("general.architecture", &arch_val),
         ("general.name", &name_val),
         ("general.file_type", &file_type_val),
@@ -363,6 +375,9 @@ fn main() -> anyhow::Result<()> {
         ("qwen2.attention.head_count_kv", &head_count_kv_val),
         ("kugelaudio.vae_dim", &vae_dim_val),
     ];
+    if let Some(ref tok_val) = tokenizer_val {
+        metadata.push(("tokenizer.huggingface.json", tok_val));
+    }
 
     // ── 5. Write GGUF file ───────────────────────────────────────────────
     let tensor_refs: Vec<(&str, &QTensor)> = gguf_tensors
