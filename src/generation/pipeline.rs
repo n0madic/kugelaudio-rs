@@ -47,6 +47,22 @@ pub struct GenerationParams {
     pub diffusion_steps: u32,
 }
 
+/// Hard upper bounds for server-side validation.
+pub const MAX_CFG_SCALE: f32 = 10.0;
+pub const MAX_NEW_TOKENS_LIMIT: u32 = 8192;
+pub const MAX_DIFFUSION_STEPS: u32 = 100;
+pub const MAX_TEXT_CHARS: usize = 10_000;
+
+impl GenerationParams {
+    /// Clamp all fields to safe ranges and return a validated copy.
+    pub fn validated(mut self) -> Self {
+        self.cfg_scale = self.cfg_scale.clamp(0.0, MAX_CFG_SCALE);
+        self.max_new_tokens = self.max_new_tokens.clamp(1, MAX_NEW_TOKENS_LIMIT);
+        self.diffusion_steps = self.diffusion_steps.clamp(1, MAX_DIFFUSION_STEPS);
+        self
+    }
+}
+
 impl Default for GenerationParams {
     fn default() -> Self {
         Self {

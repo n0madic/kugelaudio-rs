@@ -1,11 +1,17 @@
+use std::io::Read as _;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use tiny_http::{Header, Method, Response, Server};
 
 use super::protocol::{GenerateRequest, GenerateResponse, WorkItem};
 
 const CONTENT_TYPE_JSON: &str = "application/json";
+/// Maximum allowed request body size (10 MB).
+const MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
+/// Timeout for waiting on a generation response from the server loop.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Spawn a thread that listens for HTTP requests.
 ///
@@ -38,38 +44,57 @@ pub fn spawn_http_listener(
             let response = match (request.method(), request.url()) {
                 (Method::Get, "/health") => json_response(r#"{"status":"ok"}"#, 200),
                 (Method::Post, "/generate") => {
-                    let mut body = String::new();
-                    if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                        json_response(&error_json(&format!("Failed to read body: {e}")), 400)
+                    // Reject oversized bodies before reading.
+                    let content_len = request.body_length().unwrap_or(0);
+                    if content_len > MAX_BODY_BYTES as usize {
+                        json_response(
+                            &error_json(&format!(
+                                "Request body too large ({content_len} bytes, max {MAX_BODY_BYTES})"
+                            )),
+                            413,
+                        )
                     } else {
-                        match serde_json::from_str::<GenerateRequest>(&body) {
-                            Err(e) => json_response(
-                                &error_json(&format!("Invalid request JSON: {e}")),
-                                400,
-                            ),
-                            Ok(req) => {
-                                let (reply_tx, reply_rx) = mpsc::channel();
-                                let gen_response = if work_tx
-                                    .send(WorkItem {
-                                        request: req,
-                                        reply_tx,
-                                    })
-                                    .is_err()
-                                {
-                                    GenerateResponse::Error {
-                                        message: "Server shutting down".to_string(),
+                        let mut body = String::new();
+                        let read_result = request
+                            .as_reader()
+                            .take(MAX_BODY_BYTES + 1)
+                            .read_to_string(&mut body);
+                        if let Err(e) = read_result {
+                            json_response(&error_json(&format!("Failed to read body: {e}")), 400)
+                        } else if body.len() as u64 > MAX_BODY_BYTES {
+                            json_response(&error_json("Request body too large"), 413)
+                        } else {
+                            match serde_json::from_str::<GenerateRequest>(&body) {
+                                Err(e) => json_response(
+                                    &error_json(&format!("Invalid request JSON: {e}")),
+                                    400,
+                                ),
+                                Ok(req) => {
+                                    let (reply_tx, reply_rx) = mpsc::channel();
+                                    let gen_response = if work_tx
+                                        .send(WorkItem {
+                                            request: req,
+                                            reply_tx,
+                                        })
+                                        .is_err()
+                                    {
+                                        GenerateResponse::Error {
+                                            message: "Server shutting down".to_string(),
+                                        }
+                                    } else {
+                                        reply_rx.recv_timeout(REPLY_TIMEOUT).unwrap_or(
+                                            GenerateResponse::Error {
+                                                message: "Generation timed out".to_string(),
+                                            },
+                                        )
+                                    };
+                                    match serde_json::to_string(&gen_response) {
+                                        Ok(json) => json_response(&json, 200),
+                                        Err(e) => json_response(
+                                            &error_json(&format!("Serialize error: {e}")),
+                                            500,
+                                        ),
                                     }
-                                } else {
-                                    reply_rx.recv().unwrap_or(GenerateResponse::Error {
-                                        message: "No response from server loop".to_string(),
-                                    })
-                                };
-                                match serde_json::to_string(&gen_response) {
-                                    Ok(json) => json_response(&json, 200),
-                                    Err(e) => json_response(
-                                        &error_json(&format!("Serialize error: {e}")),
-                                        500,
-                                    ),
                                 }
                             }
                         }

@@ -116,7 +116,22 @@ fn load_config(model_dir: &Path) -> Result<KugelAudioConfig> {
 /// Uses `VarBuilder::from_mmaped_safetensors` which memory-maps the shard
 /// files. The files must not be modified while this function is running.
 pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> {
-    let config = load_config(model_dir)?;
+    // Resolve symlinks and normalize the path before memory-mapping to
+    // prevent path-traversal attacks.
+    let model_dir = model_dir.canonicalize().map_err(|e| {
+        KugelAudioError::WeightLoading(format!(
+            "Cannot resolve model directory {}: {e}",
+            model_dir.display()
+        ))
+    })?;
+    if !model_dir.is_dir() {
+        return Err(KugelAudioError::WeightLoading(format!(
+            "{} is not a directory",
+            model_dir.display()
+        )));
+    }
+
+    let config = load_config(&model_dir)?;
     // BF16 for GPU (Metal/CUDA), F32 for CPU (which lacks BF16 matmul).
     let dtype = match device {
         Device::Cpu => DType::F32,
@@ -124,7 +139,9 @@ pub fn load_model(model_dir: &Path, device: &Device) -> Result<KugelAudioModel> 
     };
 
     // Build VarBuilder over all shards.
-    let shard_paths = find_safetensor_shards(model_dir)?;
+    let shard_paths = find_safetensor_shards(&model_dir)?;
+    // SAFETY: files are resolved through canonicalize() above and must not
+    // be modified while mapped. This is inherent to memory-mapped I/O.
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, device).map_err(|e| {
             KugelAudioError::WeightLoading(format!("Failed to mmap safetensors: {e}"))

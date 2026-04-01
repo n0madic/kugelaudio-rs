@@ -6,7 +6,7 @@ use tokenizers::Tokenizer;
 
 use crate::audio::wav;
 use crate::config::{SAMPLE_RATE, SpecialTokens};
-use crate::generation::pipeline::{self, GenerationParams};
+use crate::generation::pipeline::{self, GenerationParams, MAX_TEXT_CHARS};
 use crate::model::weights::KugelAudioModel;
 
 use super::protocol::{GenerateResponse, WorkItem};
@@ -32,11 +32,23 @@ pub fn run_server_loop(
     for item in work_rx {
         let req = &item.request;
 
+        // Reject oversized text early, before tokenization.
+        if req.text.len() > MAX_TEXT_CHARS {
+            let _ = item.reply_tx.send(GenerateResponse::Error {
+                message: format!(
+                    "Text too long ({} chars, max {MAX_TEXT_CHARS})",
+                    req.text.len()
+                ),
+            });
+            continue;
+        }
+
         let params = GenerationParams {
             cfg_scale: req.cfg_scale.unwrap_or(defaults.cfg_scale),
             max_new_tokens: req.max_tokens.unwrap_or(defaults.max_tokens),
             diffusion_steps: req.diffusion_steps.unwrap_or(defaults.diffusion_steps),
-        };
+        }
+        .validated();
 
         let response = match pipeline::generate(model, tokenizer, &req.text, &params) {
             Err(e) => GenerateResponse::Error {
