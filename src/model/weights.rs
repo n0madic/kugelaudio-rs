@@ -522,23 +522,39 @@ mod tests {
     fn test_gguf_auto_detect() {
         let device = Device::Cpu;
 
-        // A nonexistent .gguf path is neither is_file() nor is_dir(), so it
-        // falls through to the "neither" error branch.
-        let gguf_result = load_model(Path::new("/nonexistent/model.gguf"), &device);
+        // Create temp artifacts to exercise real auto-detection branches.
+        let tmp_dir = std::env::temp_dir().join("kugelaudio_test_gguf_detect");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let gguf_path = tmp_dir.join("model.gguf");
+        std::fs::write(&gguf_path, b"not a real gguf").unwrap();
+
+        // A .gguf file routes to load_model_gguf (fails parsing the invalid content).
+        let gguf_result = load_model(&gguf_path, &device);
         assert!(gguf_result.is_err());
         let err_msg = format!("{}", gguf_result.err().expect("should fail"));
         assert!(
-            err_msg.contains("neither a .gguf file nor a model directory"),
-            "Expected detection error, got: {err_msg}"
+            err_msg.contains("Failed to parse GGUF"),
+            "Expected GGUF parse error, got: {err_msg}"
         );
 
-        // A nonexistent directory path should also fail with the same error.
-        let dir_result = load_model(Path::new("/nonexistent/model_dir"), &device);
+        // A directory routes to load_model_safetensors (fails on missing config).
+        let dir_result = load_model(&tmp_dir, &device);
         assert!(dir_result.is_err());
         let err_msg = format!("{}", dir_result.err().expect("should fail"));
         assert!(
-            err_msg.contains("neither a .gguf file nor a model directory"),
-            "Expected detection error, got: {err_msg}"
+            err_msg.contains("config.json"),
+            "Expected safetensors config error, got: {err_msg}"
         );
+
+        // A nonexistent path hits the fallback branch.
+        let bad_result = load_model(Path::new("/nonexistent/path"), &device);
+        assert!(bad_result.is_err());
+        let err_msg = format!("{}", bad_result.err().expect("should fail"));
+        assert!(
+            err_msg.contains("neither a .gguf file nor a model directory"),
+            "Expected format detection error, got: {err_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
