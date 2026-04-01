@@ -93,7 +93,7 @@ impl Qwen2Config {
 ///
 /// Stored as `[max_seq_len, head_dim/2]` so we can cheap-slice by position.
 #[derive(Debug, Clone)]
-struct RotaryEmbedding {
+pub(crate) struct RotaryEmbedding {
     /// `[max_seq_len, head_dim/2]`
     sin: Tensor,
     /// `[max_seq_len, head_dim/2]`
@@ -101,7 +101,7 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
-    fn new(dtype: DType, cfg: &Qwen2Config, device: &Device) -> Result<Self> {
+    pub(crate) fn new(dtype: DType, cfg: &Qwen2Config, device: &Device) -> Result<Self> {
         let head_dim = cfg.head_dim;
         let half_dim = head_dim / 2;
         // inv_freq[i] = 1 / theta^(2i / head_dim)
@@ -128,7 +128,12 @@ impl RotaryEmbedding {
     ///
     /// `q` and `k` must have shape `[batch, num_heads, seq_len, head_dim]`.
     /// `seqlen_offset` is the number of tokens already in the KV cache.
-    fn apply(&self, q: &Tensor, k: &Tensor, seqlen_offset: usize) -> Result<(Tensor, Tensor)> {
+    pub(crate) fn apply(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
         let seq_len = q.dim(2)?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
@@ -355,7 +360,7 @@ impl DecoderLayer {
 ///
 /// Input:  `[batch, num_kv_heads, seq_len, head_dim]`
 /// Output: `[batch, num_kv_heads * n_rep, seq_len, head_dim]`
-fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
+pub(crate) fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         return Ok(xs);
     }
@@ -371,7 +376,7 @@ fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
 ///
 /// Returns `[batch, 1, tgt_len, tgt_len + seqlen_offset]` with 0 for
 /// attended positions and `-inf` for masked-out (future) positions.
-fn make_causal_mask(
+pub(crate) fn make_causal_mask(
     b_size: usize,
     tgt_len: usize,
     seqlen_offset: usize,
